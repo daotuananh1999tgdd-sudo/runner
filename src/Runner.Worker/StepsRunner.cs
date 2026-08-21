@@ -1,20 +1,17 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using GitHub.DistributedTask.Expressions2;
 using GitHub.DistributedTask.ObjectTemplating.Tokens;
-using GitHub.DistributedTask.Pipelines;
 using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.Pipelines.ObjectTemplating;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
 using GitHub.Runner.Common.Util;
 using GitHub.Runner.Sdk;
+using GitHub.Runner.Worker.Dap;
 using GitHub.Runner.Worker.Expressions;
-using ObjectTemplating = GitHub.DistributedTask.ObjectTemplating;
-using Pipelines = GitHub.DistributedTask.Pipelines;
 
 namespace GitHub.Runner.Worker
 {
@@ -25,6 +22,8 @@ namespace GitHub.Runner.Worker
         string DisplayName { get; set; }
         IExecutionContext ExecutionContext { get; set; }
         TemplateToken Timeout { get; }
+        bool TryUpdateDisplayName(out bool updated);
+        bool EvaluateDisplayName(DictionaryContextData contextData, IExecutionContext context, out bool updated);
         Task RunAsync();
     }
 
@@ -42,6 +41,8 @@ namespace GitHub.Runner.Worker
             ArgUtil.NotNull(jobContext, nameof(jobContext));
             ArgUtil.NotNull(jobContext.JobSteps, nameof(jobContext.JobSteps));
 
+            var _bgCoordinator = HostContext.GetService<IBackgroundStepCoordinator>();
+
             // TaskResult:
             //  Abandoned (Server set this.)
             //  Canceled
@@ -52,11 +53,21 @@ namespace GitHub.Runner.Worker
             jobContext.JobContext.Status = (jobContext.Result ?? TaskResult.Succeeded).ToActionResult();
             var scopeInputs = new Dictionary<string, PipelineContextData>(StringComparer.OrdinalIgnoreCase);
             bool checkPostJobActions = false;
+            var dapDebugger = HostContext.GetService<IDapDebugger>();
             while (jobContext.JobSteps.Count > 0 || !checkPostJobActions)
             {
                 if (jobContext.JobSteps.Count == 0 && !checkPostJobActions)
                 {
                     checkPostJobActions = true;
+
+                    // Safety net: wait for any unwaited background steps before post-hooks
+                    var backgroundResult = await _bgCoordinator.WaitForUnwaitedStepsAsync(jobContext.CancellationToken);
+                    if (backgroundResult != TaskResult.Succeeded)
+                    {
+                        jobContext.Result = TaskResultUtil.MergeTaskResults(jobContext.Result, backgroundResult);
+                        jobContext.JobContext.Status = jobContext.Result?.ToActionResult();
+                    }
+
                     while (jobContext.PostJobSteps.TryPop(out var postStep))
                     {
                         jobContext.JobSteps.Enqueue(postStep);
@@ -72,8 +83,11 @@ namespace GitHub.Runner.Worker
                 ArgUtil.NotNull(step.ExecutionContext.Global, nameof(step.ExecutionContext.Global));
                 ArgUtil.NotNull(step.ExecutionContext.Global.Variables, nameof(step.ExecutionContext.Global.Variables));
 
-                // Start
-                step.ExecutionContext.Start();
+                // Start — defer for background steps until the slot is acquired
+                if (!step.ExecutionContext.IsBackground)
+                {
+                    step.ExecutionContext.Start();
+                }
 
                 // Expression functions
                 step.ExecutionContext.ExpressionFunctions.Add(new FunctionInfo<AlwaysFunction>(PipelineTemplateConstants.Always, 0, 0));
@@ -111,6 +125,7 @@ namespace GitHub.Runner.Worker
                         foreach (var env in actionEnvironment)
                         {
                             envContext[env.Key] = new StringContextData(env.Value ?? string.Empty);
+                            step.ExecutionContext.StepEnvironmentOverrides.Add(env.Key);
                         }
                     }
                     catch (Exception ex)
@@ -130,11 +145,13 @@ namespace GitHub.Runner.Worker
                         // Register job cancellation call back only if job cancellation token not been fire before each step run
                         if (!jobContext.CancellationToken.IsCancellationRequested)
                         {
-                            // Test the condition again. The job was canceled after the condition was originally evaluated.
+                            // Test the condition again. The job was cancelled after the condition was originally evaluated.
                             jobCancelRegister = jobContext.CancellationToken.Register(() =>
                             {
-                                // Mark job as cancelled
-                                jobContext.Result = TaskResult.Canceled;
+                                // Mark job as Cancelled or Failed depending on HostContext shutdown token's cancellation
+                                jobContext.Result = HostContext.RunnerShutdownToken.IsCancellationRequested
+                                                    ? TaskResult.Failed
+                                                    : TaskResult.Canceled;
                                 jobContext.JobContext.Status = jobContext.Result?.ToActionResult();
 
                                 step.ExecutionContext.Debug($"Re-evaluate condition on job cancellation for step: '{step.DisplayName}'.");
@@ -172,8 +189,10 @@ namespace GitHub.Runner.Worker
                         {
                             if (jobContext.Result != TaskResult.Canceled)
                             {
-                                // Mark job as cancelled
-                                jobContext.Result = TaskResult.Canceled;
+                                // Mark job as Cancelled or Failed depending on HostContext shutdown token's cancellation
+                                jobContext.Result = HostContext.RunnerShutdownToken.IsCancellationRequested
+                                    ? TaskResult.Failed
+                                    : TaskResult.Canceled;
                                 jobContext.JobContext.Status = jobContext.Result?.ToActionResult();
                             }
                         }
@@ -189,6 +208,12 @@ namespace GitHub.Runner.Worker
                         }
                         else
                         {
+                            // This is our last, best chance to expand the display name.  (At this point, all the requirements for successful expansion should be met.)
+                            // That being said, evaluating the display name should still be considered as a "best effort" exercise.  (It's not critical or paramount.)
+                            // For that reason, we call a safe "Try..." wrapper method to ensure that any potential problems we encounter in evaluating the display name
+                            // don't interfere with our ultimate goal within this code block:  evaluation of the condition.
+                            step.TryUpdateDisplayName(out _);
+
                             try
                             {
                                 var templateEvaluator = step.ExecutionContext.ToPipelineTemplateEvaluator(conditionTraceWriter);
@@ -217,9 +242,22 @@ namespace GitHub.Runner.Worker
                         }
                         else
                         {
-                            // Run the step
-                            await RunStepAsync(step, jobContext.CancellationToken);
-                            CompleteStep(step);
+                            if (step.ExecutionContext.IsBackground)
+                            {
+                                // Queue the background step via coordinator
+                                _bgCoordinator.StartBackgroundStep(step, jobContext.CancellationToken);
+                            }
+                            else
+                            {
+                                // Pause for DAP debugger before step execution
+                                await dapDebugger?.OnStepStartingAsync(step);
+
+                                // Run the step synchronously (normal behavior)
+                                await RunStepAsync(step, jobContext.CancellationToken);
+                                CompleteStep(step);
+
+                                dapDebugger?.OnStepCompleted(step);
+                            }
                         }
                     }
                     finally
@@ -246,18 +284,11 @@ namespace GitHub.Runner.Worker
 
                 Trace.Info($"Current state: job state = '{jobContext.Result}'");
             }
+
         }
 
         private async Task RunStepAsync(IStep step, CancellationToken jobCancellationToken)
         {
-            // Check to see if we can expand the display name
-            if (step is IActionRunner actionRunner &&
-                actionRunner.Stage == ActionRunStage.Main &&
-                actionRunner.TryEvaluateDisplayName(step.ExecutionContext.ExpressionValues, step.ExecutionContext))
-            {
-                step.ExecutionContext.UpdateTimelineRecordDisplayName(actionRunner.DisplayName);
-            }
-
             // Start the step
             Trace.Info("Starting the step.");
             step.ExecutionContext.Debug($"Starting: {step.DisplayName}");
@@ -294,7 +325,7 @@ namespace GitHub.Runner.Worker
                     !jobCancellationToken.IsCancellationRequested)
                 {
                     Trace.Error($"Caught timeout exception from step: {ex.Message}");
-                    step.ExecutionContext.Error("The action has timed out.");
+                    step.ExecutionContext.Error($"The action '{step.DisplayName}' has timed out after {timeoutMinutes} minutes.");
                     step.ExecutionContext.Result = TaskResult.Failed;
                 }
                 else
@@ -319,29 +350,8 @@ namespace GitHub.Runner.Worker
                 step.ExecutionContext.Result = TaskResultUtil.MergeTaskResults(step.ExecutionContext.Result, step.ExecutionContext.CommandResult.Value);
             }
 
-            // Fixup the step result if ContinueOnError
-            if (step.ExecutionContext.Result == TaskResult.Failed)
-            {
-                var continueOnError = false;
-                try
-                {
-                    continueOnError = templateEvaluator.EvaluateStepContinueOnError(step.ContinueOnError, step.ExecutionContext.ExpressionValues, step.ExecutionContext.ExpressionFunctions);
-                }
-                catch (Exception ex)
-                {
-                    Trace.Info("The step failed and an error occurred when attempting to determine whether to continue on error.");
-                    Trace.Error(ex);
-                    step.ExecutionContext.Error("The step failed and an error occurred when attempting to determine whether to continue on error.");
-                    step.ExecutionContext.Error(ex);
-                }
+            step.ExecutionContext.ApplyContinueOnError(step.ContinueOnError);
 
-                if (continueOnError)
-                {
-                    step.ExecutionContext.Outcome = step.ExecutionContext.Result;
-                    step.ExecutionContext.Result = TaskResult.Succeeded;
-                    Trace.Info($"Updated step result (continue on error)");
-                }
-            }
             Trace.Info($"Step result: {step.ExecutionContext.Result}");
 
             // Complete the step context
@@ -353,44 +363,6 @@ namespace GitHub.Runner.Worker
             var executionContext = step.ExecutionContext;
 
             executionContext.Complete(result, resultCode: resultCode);
-        }
-
-        private sealed class ConditionTraceWriter : ObjectTemplating::ITraceWriter
-        {
-            private readonly IExecutionContext _executionContext;
-            private readonly Tracing _trace;
-            private readonly StringBuilder _traceBuilder = new StringBuilder();
-
-            public string Trace => _traceBuilder.ToString();
-
-            public ConditionTraceWriter(Tracing trace, IExecutionContext executionContext)
-            {
-                ArgUtil.NotNull(trace, nameof(trace));
-                _trace = trace;
-                _executionContext = executionContext;
-            }
-
-            public void Error(string format, params Object[] args)
-            {
-                var message = StringUtil.Format(format, args);
-                _trace.Error(message);
-                _executionContext?.Debug(message);
-            }
-
-            public void Info(string format, params Object[] args)
-            {
-                var message = StringUtil.Format(format, args);
-                _trace.Info(message);
-                _executionContext?.Debug(message);
-                _traceBuilder.AppendLine(message);
-            }
-
-            public void Verbose(string format, params Object[] args)
-            {
-                var message = StringUtil.Format(format, args);
-                _trace.Verbose(message);
-                _executionContext?.Debug(message);
-            }
         }
     }
 }

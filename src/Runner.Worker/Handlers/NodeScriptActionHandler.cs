@@ -1,12 +1,18 @@
-﻿using System.IO;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using GitHub.Runner.Common;
-using GitHub.Runner.Sdk;
+using GitHub.DistributedTask.Pipelines;
+using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.WebApi;
-using Pipelines = GitHub.DistributedTask.Pipelines;
-using System;
-using System.Linq;
+using GitHub.Runner.Common;
+using GitHub.Runner.Common.Util;
+using GitHub.Runner.Sdk;
+using GitHub.Runner.Worker.Container;
+using GitHub.Runner.Worker.Container.ContainerHooks;
+using GitHub.Services.Common;
 
 namespace GitHub.Runner.Worker.Handlers
 {
@@ -53,6 +59,37 @@ namespace GitHub.Runner.Worker.Handlers
             {
                 Environment["ACTIONS_CACHE_URL"] = cacheUrl;
             }
+            if (systemConnection.Data.TryGetValue("PipelinesServiceUrl", out var pipelinesServiceUrl) && !string.IsNullOrEmpty(pipelinesServiceUrl))
+            {
+                Environment["ACTIONS_RUNTIME_URL"] = pipelinesServiceUrl;
+            }
+            if (systemConnection.Data.TryGetValue("GenerateIdTokenUrl", out var generateIdTokenUrl) && !string.IsNullOrEmpty(generateIdTokenUrl))
+            {
+                Environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = generateIdTokenUrl;
+                Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
+            }
+            if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+            {
+                Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
+            }
+
+            if (ExecutionContext.Global.Variables.GetBoolean("actions_uses_cache_service_v2") ?? false)
+            {
+                Environment["ACTIONS_CACHE_SERVICE_V2"] = bool.TrueString;
+            }
+
+            if (ExecutionContext.Global.Variables.TryGetValue("actions_cache_mode", out var cacheMode) && !string.IsNullOrEmpty(cacheMode))
+            {
+                Environment["ACTIONS_CACHE_MODE"] = cacheMode;
+            }
+
+            if (ExecutionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SetOrchestrationIdEnvForActions) ?? false)
+            {
+                if (ExecutionContext.Global.Variables.TryGetValue(Constants.Variables.System.OrchestrationId, out var orchestrationId) && !string.IsNullOrEmpty(orchestrationId))
+                {
+                    Environment["ACTIONS_ORCHESTRATION_ID"] = orchestrationId;
+                }
+            }
 
             // Resolve the target script.
             string target = null;
@@ -69,6 +106,13 @@ namespace GitHub.Runner.Worker.Handlers
                 target = Data.Post;
             }
 
+            // Set extra telemetry base on the current context.
+            if (stage == ActionRunStage.Main)
+            {
+                ExecutionContext.StepTelemetry.HasPreStep = Data.HasPre;
+                ExecutionContext.StepTelemetry.HasPostStep = Data.HasPost;
+            }
+
             ArgUtil.NotNullOrEmpty(target, nameof(target));
             target = Path.Combine(ActionDirectory, target);
             ArgUtil.File(target, nameof(target));
@@ -80,14 +124,24 @@ namespace GitHub.Runner.Worker.Handlers
                 workingDirectory = HostContext.GetDirectory(WellKnownDirectory.Work);
             }
 
-            var nodeRuntimeVersion = await StepHost.DetermineNodeRuntimeVersion(ExecutionContext);
+            var nodeRuntimeVersion = await StepHost.DetermineNodeRuntimeVersion(ExecutionContext, Data.NodeVersion);
+            ExecutionContext.StepTelemetry.Type = nodeRuntimeVersion;
             string file = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), nodeRuntimeVersion, "bin", $"node{IOUtil.ExeExtension}");
 
             // Format the arguments passed to node.
             // 1) Wrap the script file path in double quotes.
             // 2) Escape double quotes within the script file path. Double-quote is a valid
             // file name character on Linux.
-            string arguments = StepHost.ResolvePathForStepHost(StringUtil.Format(@"""{0}""", target.Replace(@"""", @"\""")));
+            string arguments = StepHost.ResolvePathForStepHost(ExecutionContext, StringUtil.Format(@"""{0}""", target.Replace(@"""", @"\""")));
+
+            // Disable maglev jit compiler in node.js 24.x.x on x64 Windows until the node.js bug is fixed.
+            // https://github.com/nodejs/node/issues/62260
+            if (nodeRuntimeVersion.StartsWith("node24", StringComparison.OrdinalIgnoreCase) &&
+                (StringUtil.ConvertToBoolean(System.Environment.GetEnvironmentVariable("ACTIONS_RUNNER_DISABLE_NODE_MAGLEV")) || StringUtil.ConvertToBoolean(Environment.GetValueOrDefault("ACTIONS_RUNNER_DISABLE_NODE_MAGLEV"))))
+            {
+                Trace.Info("Disable maglev jit compiler in node.js");
+                arguments = $"--no-maglev {arguments}";
+            }
 
 #if OS_WINDOWS
             // It appears that node.exe outputs UTF8 when not in TTY mode.
@@ -109,14 +163,16 @@ namespace GitHub.Runner.Worker.Handlers
                 // Execute the process. Exit code 0 should always be returned.
                 // A non-zero exit code indicates infrastructural failure.
                 // Task failure should be communicated over STDOUT using ## commands.
-                Task<int> step = StepHost.ExecuteAsync(workingDirectory: StepHost.ResolvePathForStepHost(workingDirectory),
-                                                fileName: StepHost.ResolvePathForStepHost(file),
+                Task<int> step = StepHost.ExecuteAsync(ExecutionContext,
+                                                workingDirectory: StepHost.ResolvePathForStepHost(ExecutionContext, workingDirectory),
+                                                fileName: StepHost.ResolvePathForStepHost(ExecutionContext, file),
                                                 arguments: arguments,
                                                 environment: Environment,
                                                 requireExitCodeZero: false,
                                                 outputEncoding: outputEncoding,
                                                 killProcessOnCancel: false,
                                                 inheritConsoleHandler: !ExecutionContext.Global.Variables.Retain_Default_Encoding,
+                                                standardInInput: null,
                                                 cancellationToken: ExecutionContext.CancellationToken);
 
                 // Wait for either the node exit or force finish through ##vso command

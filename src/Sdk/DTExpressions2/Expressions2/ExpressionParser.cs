@@ -321,7 +321,7 @@ namespace GitHub.DistributedTask.Expressions2
                     context.Operators.Pop();
                 }
                 var functionOperands = PopOperands(context, parameterCount);
-                
+
                 // Node already exists on the operand stack
                 function = (Function)context.Operands.Peek();
 
@@ -348,6 +348,10 @@ namespace GitHub.DistributedTask.Expressions2
             else if (function.Parameters.Count > functionInfo.MaxParameters)
             {
                 throw new ParseException(ParseExceptionKind.TooManyParameters, token: @operator, expression: context.Expression);
+            }
+            else if (functionInfo.Name.Equals("case", StringComparison.OrdinalIgnoreCase) && function.Parameters.Count % 2 == 0)
+            {
+                throw new ParseException(ParseExceptionKind.EvenParameters, token: @operator, expression: context.Expression);
             }
         }
 

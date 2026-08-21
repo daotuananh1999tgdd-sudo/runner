@@ -18,7 +18,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
     /// Evaluates parts of the workflow DOM. For example, a job strategy or step inputs.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public class PipelineTemplateEvaluator
+    public class PipelineTemplateEvaluator : IPipelineTemplateEvaluator
     {
         public PipelineTemplateEvaluator(
             ITraceWriter trace,
@@ -50,6 +50,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public Int32 MaxEvents => 1000000; // 1 million
 
         public Int32 MaxResultSize { get; set; } = 10 * 1024 * 1024; // 10 mb
+
+        public bool AllowServiceContainerCommand { get; set; }
 
         public Boolean EvaluateStepContinueOnError(
             TemplateToken token,
@@ -357,7 +359,33 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                 {
                     token = TemplateEvaluator.Evaluate(context, PipelineTemplateConstants.Services, token, 0, null, omitHeader: true);
                     context.Errors.Check();
-                    result = PipelineTemplateConverter.ConvertToJobServiceContainers(context, token);
+                    result = PipelineTemplateConverter.ConvertToJobServiceContainers(context, token, allowServiceContainerCommand: AllowServiceContainerCommand);
+                }
+                catch (Exception ex) when (!(ex is TemplateValidationException))
+                {
+                    context.Errors.Add(ex);
+                }
+
+                context.Errors.Check();
+            }
+
+            return result;
+        }
+
+        public Snapshot EvaluateJobSnapshotRequest(TemplateToken token,
+            DictionaryContextData contextData,
+            IList<IFunctionInfo> expressionFunctions)
+        {
+            var result = default(Snapshot);
+
+            if (token != null && token.Type != TokenType.Null)
+            {
+                var context = CreateContext(contextData, expressionFunctions);
+                try
+                {
+                    token = TemplateEvaluator.Evaluate(context, PipelineTemplateConstants.Snapshot, token, 0, null, omitHeader: true);
+                    context.Errors.Check();
+                    result = PipelineTemplateConverter.ConvertToJobSnapshotRequest(context, token);
                 }
                 catch (Exception ex) when (!(ex is TemplateValidationException))
                 {
@@ -455,7 +483,6 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         private readonly String[] s_expressionValueNames = new[]
         {
             PipelineTemplateConstants.GitHub,
-            PipelineTemplateConstants.Needs,
             PipelineTemplateConstants.Strategy,
             PipelineTemplateConstants.Matrix,
             PipelineTemplateConstants.Needs,
@@ -465,6 +492,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             PipelineTemplateConstants.Job,
             PipelineTemplateConstants.Runner,
             PipelineTemplateConstants.Env,
+            PipelineTemplateConstants.Vars,
         };
         private readonly String[] s_expressionFunctionNames = new[]
         {

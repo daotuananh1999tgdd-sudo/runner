@@ -1,5 +1,4 @@
-﻿using GitHub.Runner.Common.Util;
-using GitHub.Runner.Sdk;
+﻿using GitHub.Runner.Sdk;
 using System;
 using System.Collections.Generic;
 
@@ -32,7 +31,7 @@ namespace GitHub.Runner.Common
             new EscapeMapping(token: "%", replacement: "%25"),
         };
 
-        private readonly Dictionary<string, string> _properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> _properties = new(StringComparer.OrdinalIgnoreCase);
         public const string Prefix = "##[";
         public const string _commandKey = "::";
 
@@ -203,6 +202,26 @@ namespace GitHub.Runner.Common
             }
 
             return unescaped;
+        }
+
+        /// <summary>
+        /// Escapes special characters in a value using the standard action command escape mappings.
+        /// Iterates in reverse so that '%' is escaped first to avoid double-encoding.
+        /// </summary>
+        public static string EscapeValue(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+
+            string escaped = value;
+            for (int i = _escapeMappings.Length - 1; i >= 0; i--)
+            {
+                escaped = escaped.Replace(_escapeMappings[i].Token, _escapeMappings[i].Replacement);
+            }
+
+            return escaped;
         }
 
         private static string UnescapeProperty(string escaped)

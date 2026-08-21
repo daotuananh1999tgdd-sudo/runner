@@ -3,20 +3,14 @@ using GitHub.DistributedTask.ObjectTemplating.Tokens;
 using GitHub.DistributedTask.Pipelines;
 using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.WebApi;
-using GitHub.Runner.Common.Util;
 using GitHub.Runner.Worker;
-using GitHub.Runner.Worker.Container;
 using GitHub.Runner.Worker.Handlers;
 using Moq;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.IO.Compression;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
-using System.Threading.Tasks;
 using Xunit;
 using Pipelines = GitHub.DistributedTask.Pipelines;
 
@@ -31,10 +25,10 @@ namespace GitHub.Runner.Common.Tests.Worker
         private Mock<IExecutionContext> _ec;
         private TestHostContext _hc;
         private ActionRunner _actionRunner;
-        private IActionManifestManager _actionManifestManager;
+        private IActionManifestManagerWrapper _actionManifestManager;
         private Mock<IFileCommandManager> _fileCommandManager;
 
-        private DictionaryContextData _context = new DictionaryContextData();
+        private DictionaryContextData _context = new();
 
         [Fact]
         [Trait("Level", "L0")]
@@ -60,9 +54,9 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             _actionRunner.Action = action;
 
-            Dictionary<string, string> finialInputs = new Dictionary<string, string>();
-            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>()))
-                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory) =>
+            Dictionary<string, string> finialInputs = new();
+            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>(), It.IsAny<List<JobExtensionRunner>>()))
+                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory, List<JobExtensionRunner> localActionContainerSetupSteps) =>
                            {
                                finialInputs = inputs;
                            })
@@ -106,9 +100,9 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             _actionRunner.Action = action;
 
-            Dictionary<string, string> finialInputs = new Dictionary<string, string>();
-            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>()))
-                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory) =>
+            Dictionary<string, string> finialInputs = new();
+            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>(), It.IsAny<List<JobExtensionRunner>>()))
+                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory, List<JobExtensionRunner> localActionContainerSetupSteps) =>
                            {
                                finialInputs = inputs;
                            })
@@ -118,7 +112,7 @@ namespace GitHub.Runner.Common.Tests.Worker
             await _actionRunner.RunAsync();
 
             //Assert
-            _ec.Verify(x => x.SetGitHubContext("event_path", Path.Combine(_hc.GetDirectory(WellKnownDirectory.Temp), "_github_workflow", "event.json")), Times.Once);
+            _ec.Verify(x => x.WriteWebhookPayload(), Times.Once);
         }
 
         [Fact]
@@ -149,11 +143,12 @@ namespace GitHub.Runner.Common.Tests.Worker
             _context.Add("matrix", matrixData);
 
             // Act
-            // Should not do anything if we don't have a displayNameToken to expand
-            var didUpdateDisplayName = _actionRunner.TryEvaluateDisplayName(_context, _actionRunner.ExecutionContext);
+            // Should report success with no updated required if there's already a valid display name.
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
 
             // Assert
-            Assert.False(didUpdateDisplayName);
+            Assert.True(validDisplayName);
+            Assert.False(updated);
             Assert.Equal(actionDisplayName, _actionRunner.DisplayName);
         }
 
@@ -183,12 +178,50 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             // Act
             // Should expand the displaynameToken and set the display name to that
-            var didUpdateDisplayName = _actionRunner.TryEvaluateDisplayName(_context, _actionRunner.ExecutionContext);
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
 
             // Assert
-            Assert.True(didUpdateDisplayName);
+            Assert.True(validDisplayName);
+            Assert.True(updated);
             Assert.Equal(expectedString, _actionRunner.DisplayName);
         }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void IgnoreDisplayNameTokenWhenDisplayNameIsExplicitlySet()
+        {
+            var explicitDisplayName = "Explcitly Set Name";
+
+            // Arrange
+            Setup();
+            var actionId = Guid.NewGuid();
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "action",
+                Id = actionId,
+                DisplayName = explicitDisplayName,
+                DisplayNameToken = new BasicExpressionToken(null, null, null, "matrix.node"),
+            };
+
+            _actionRunner.Action = action;
+
+            var matrixData = new DictionaryContextData
+            {
+                ["node"] = new StringContextData("8")
+            };
+            _context.Add("matrix", matrixData);
+
+            // Act
+            // Should ignore the displayNameToken since there's already an explicit value for DisplayName
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
+
+            // Assert
+            Assert.True(validDisplayName);
+            Assert.False(updated);
+            Assert.Equal(explicitDisplayName, _actionRunner.DisplayName);
+        }
+
 
         [Fact]
         [Trait("Level", "L0")]
@@ -218,10 +251,11 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             // Act
             // Should expand the displaynameToken and set the display name to that
-            var didUpdateDisplayName = _actionRunner.TryEvaluateDisplayName(_context, _actionRunner.ExecutionContext);
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
 
             // Assert
-            Assert.True(didUpdateDisplayName);
+            Assert.True(validDisplayName);
+            Assert.True(updated);
             Assert.Equal("Run 8", _actionRunner.DisplayName);
         }
 
@@ -246,10 +280,11 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             // Act
             // Should expand the displaynameToken and set the display name to that
-            var didUpdateDisplayName = _actionRunner.TryEvaluateDisplayName(_context, _actionRunner.ExecutionContext);
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
 
             // Assert
-            Assert.True(didUpdateDisplayName);
+            Assert.True(validDisplayName);
+            Assert.True(updated);
             Assert.Equal("Run TestImageName:latest", _actionRunner.DisplayName);
         }
 
@@ -272,12 +307,101 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             // Act
             // Should not do anything if we don't have context on the display name
-            var didUpdateDisplayName = _actionRunner.TryEvaluateDisplayName(_context, _actionRunner.ExecutionContext);
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
 
             // Assert
-            Assert.False(didUpdateDisplayName);
+            Assert.False(validDisplayName);
+            Assert.False(updated);
             // Should use the pretty display name until we can eval
             Assert.Equal("${{ matrix.node }}", _actionRunner.DisplayName);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void EvaluateDisplayNameForLocalAction()
+        {
+            // Arrange
+            Setup();
+            var actionId = Guid.NewGuid();
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "action",
+                Id = actionId,
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    RepositoryType = Pipelines.PipelineConstants.SelfAlias,
+                    Path = "./"
+                }
+            };
+            _actionRunner.Action = action;
+
+            // Act
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
+
+            // Assert
+            Assert.True(validDisplayName);
+            Assert.True(updated);
+            Assert.Equal("Run ./", _actionRunner.DisplayName);  // NOT "Run /./"
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void EvaluateDisplayNameForLocalActionWithPath()
+        {
+            // Arrange
+            Setup();
+            var actionId = Guid.NewGuid();
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "action",
+                Id = actionId,
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    RepositoryType = Pipelines.PipelineConstants.SelfAlias,
+                    Path = "./.github/actions/my-action"
+                }
+            };
+            _actionRunner.Action = action;
+
+            // Act
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
+
+            // Assert
+            Assert.True(validDisplayName);
+            Assert.True(updated);
+            Assert.Equal("Run ./.github/actions/my-action", _actionRunner.DisplayName);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void EvaluateDisplayNameForRemoteActionWithPath()
+        {
+            // Arrange
+            Setup();
+            var actionId = Guid.NewGuid();
+            var action = new Pipelines.ActionStep()
+            {
+                Name = "action",
+                Id = actionId,
+                Reference = new Pipelines.RepositoryPathReference()
+                {
+                    Name = "owner/repo",
+                    Path = "subdir",
+                    Ref = "v1"
+                }
+            };
+            _actionRunner.Action = action;
+
+            // Act
+            var validDisplayName = _actionRunner.EvaluateDisplayName(_context, _actionRunner.ExecutionContext, out bool updated);
+
+            // Assert
+            Assert.True(validDisplayName);
+            Assert.True(updated);
+            Assert.Equal("Run owner/repo/subdir@v1", _actionRunner.DisplayName);
         }
 
         [Fact]
@@ -307,9 +431,9 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             _actionRunner.Action = action;
 
-            Dictionary<string, string> finialInputs = new Dictionary<string, string>();
-            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>()))
-                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory) =>
+            Dictionary<string, string> finialInputs = new();
+            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>(), It.IsAny<List<JobExtensionRunner>>()))
+                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory, List<JobExtensionRunner> localActionContainerSetupSteps) =>
                            {
                                finialInputs = inputs;
                            })
@@ -330,7 +454,7 @@ namespace GitHub.Runner.Common.Tests.Worker
             Assert.Equal("invalid1", finialInputs["invalid1"]);
             Assert.Equal("invalid2", finialInputs["invalid2"]);
 
-            _ec.Verify(x => x.AddIssue(It.Is<Issue>(s => s.Message.Contains("Unexpected input(s) 'invalid1', 'invalid2'")), It.IsAny<string>()), Times.Once);
+            _ec.Verify(x => x.AddIssue(It.Is<Issue>(s => s.Message.Contains("Unexpected input(s) 'invalid1', 'invalid2'")), It.IsAny<ExecutionContextLogOptions>()), Times.Once);
         }
 
         [Fact]
@@ -358,9 +482,9 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             _actionRunner.Action = action;
 
-            Dictionary<string, string> finialInputs = new Dictionary<string, string>();
-            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>()))
-                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory) =>
+            Dictionary<string, string> finialInputs = new();
+            _handlerFactory.Setup(x => x.Create(It.IsAny<IExecutionContext>(), It.IsAny<ActionStepDefinitionReference>(), It.IsAny<IStepHost>(), It.IsAny<ActionExecutionData>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Dictionary<string, string>>(), It.IsAny<Variables>(), It.IsAny<string>(), It.IsAny<List<JobExtensionRunner>>()))
+                           .Callback((IExecutionContext executionContext, Pipelines.ActionStepDefinitionReference actionReference, IStepHost stepHost, ActionExecutionData data, Dictionary<string, string> inputs, Dictionary<string, string> environment, Variables runtimeVariables, string taskDirectory, List<JobExtensionRunner> localActionContainerSetupSteps) =>
                            {
                                finialInputs = inputs;
                            })
@@ -423,9 +547,16 @@ namespace GitHub.Runner.Common.Tests.Worker
 
             _handlerFactory = new Mock<IHandlerFactory>();
             _defaultStepHost = new Mock<IDefaultStepHost>();
-            _actionManifestManager = new ActionManifestManager();
-            _fileCommandManager = new Mock<IFileCommandManager>();
+
+            var actionManifestLegacy = new ActionManifestManagerLegacy();
+            actionManifestLegacy.Initialize(_hc);
+            _hc.SetSingleton<IActionManifestManagerLegacy>(actionManifestLegacy);
+            var actionManifestNew = new ActionManifestManager();
+            actionManifestNew.Initialize(_hc);
+            _hc.SetSingleton<IActionManifestManager>(actionManifestNew);
+            _actionManifestManager = new ActionManifestManagerWrapper();
             _actionManifestManager.Initialize(_hc);
+            _fileCommandManager = new Mock<IFileCommandManager>();
 
             var githubContext = new GitHubContext();
             githubContext.Add("event", JToken.Parse("{\"foo\":\"bar\"}").ToPipelineContextData());
@@ -449,11 +580,11 @@ namespace GitHub.Runner.Common.Tests.Worker
             _ec.Setup(x => x.CancellationToken).Returns(_ecTokenSource.Token);
             _ec.Object.Global.Variables = new Variables(_hc, new Dictionary<string, VariableValue>());
             _ec.Setup(x => x.Write(It.IsAny<string>(), It.IsAny<string>())).Callback((string tag, string message) => { _hc.GetTrace().Info($"[{tag}]{message}"); });
-            _ec.Setup(x => x.AddIssue(It.IsAny<Issue>(), It.IsAny<string>())).Callback((Issue issue, string message) => { _hc.GetTrace().Info($"[{issue.Type}]{issue.Message ?? message}"); });
+            _ec.Setup(x => x.AddIssue(It.IsAny<Issue>(), It.IsAny<ExecutionContextLogOptions>())).Callback((Issue issue, ExecutionContextLogOptions logOptions) => { _hc.GetTrace().Info($"[{issue.Type}]{logOptions.LogMessageOverride ?? issue.Message}"); });
 
             _hc.SetSingleton<IActionManager>(_actionManager.Object);
             _hc.SetSingleton<IHandlerFactory>(_handlerFactory.Object);
-            _hc.SetSingleton<IActionManifestManager>(_actionManifestManager);
+            _hc.SetSingleton<IActionManifestManagerWrapper>(_actionManifestManager);
 
             _hc.EnqueueInstance<IDefaultStepHost>(_defaultStepHost.Object);
 

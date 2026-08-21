@@ -11,7 +11,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String BooleanStrategyContext = "boolean-strategy-context";
         public const String CancelTimeoutMinutes = "cancel-timeout-minutes";
         public const String Cancelled = "cancelled";
-        public const String Clean= "clean";
+        public const String Clean = "clean";
         public const String Container = "container";
         public const String ContinueOnError = "continue-on-error";
         public const String Credentials = "credentials";
@@ -29,6 +29,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String Id = "id";
         public const String If = "if";
         public const String Image = "image";
+        public const String ImageName = "image-name";
+        public const String CustomImageVersion = "version";
         public const String Include = "include";
         public const String Inputs = "inputs";
         public const String Job = "job";
@@ -45,6 +47,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String NumberStrategyContext = "number-strategy-context";
         public const String On = "on";
         public const String Options = "options";
+        public const String Entrypoint = "entrypoint";
+        public const String Command = "command";
         public const String Outputs = "outputs";
         public const String OutputsPattern = "needs.*.outputs";
         public const String Password = "password";
@@ -60,6 +64,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String Services = "services";
         public const String Shell = "shell";
         public const String Skipped = "skipped";
+        public const String Snapshot = "snapshot";
         public const String StepEnv = "step-env";
         public const String StepIfResult = "step-if-result";
         public const String StepWith = "step-with";
@@ -73,6 +78,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String TimeoutMinutes = "timeout-minutes";
         public const String Username = "username";
         public const String Uses = "uses";
+        public const String Vars = "vars";
         public const String VmImage = "vmImage";
         public const String Volumes = "volumes";
         public const String With = "with";
@@ -81,5 +87,6 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String WorkflowRoot = "workflow-root";
         public const String WorkingDirectory = "working-directory";
         public const String Workspace = "workspace";
+        public const String HostWorkspace = "host-workspace";
     }
 }

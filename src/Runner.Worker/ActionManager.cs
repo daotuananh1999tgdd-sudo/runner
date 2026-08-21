@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -6,17 +6,20 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using GitHub.DistributedTask.ObjectTemplating.Tokens;
+using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
+using GitHub.Runner.Common.Util;
 using GitHub.Runner.Sdk;
 using GitHub.Runner.Worker.Container;
 using GitHub.Services.Common;
-using WebApi = GitHub.DistributedTask.WebApi;
 using Pipelines = GitHub.DistributedTask.Pipelines;
 using PipelineTemplateConstants = GitHub.DistributedTask.Pipelines.ObjectTemplating.PipelineTemplateConstants;
+using WebApi = GitHub.DistributedTask.WebApi;
 
 namespace GitHub.Runner.Worker
 {
@@ -37,7 +40,10 @@ namespace GitHub.Runner.Worker
     public interface IActionManager : IRunnerService
     {
         Dictionary<Guid, ContainerInfo> CachedActionContainers { get; }
-        Task<PrepareResult> PrepareActionsAsync(IExecutionContext executionContext, IEnumerable<Pipelines.JobStep> steps);
+        Dictionary<Guid, List<Pipelines.ActionStep>> CachedEmbeddedPreSteps { get; }
+        Dictionary<Guid, List<Guid>> CachedEmbeddedStepIds { get; }
+        Dictionary<Guid, Stack<Pipelines.ActionStep>> CachedEmbeddedPostSteps { get; }
+        Task<PrepareResult> PrepareActionsAsync(IExecutionContext executionContext, IEnumerable<Pipelines.JobStep> steps, Guid rootStepId = default(Guid));
         Definition LoadAction(IExecutionContext executionContext, Pipelines.ActionStep action);
     }
 
@@ -47,11 +53,20 @@ namespace GitHub.Runner.Worker
 
         //81920 is the default used by System.IO.Stream.CopyTo and is under the large object heap threshold (85k).
         private const int _defaultCopyBufferSize = 81920;
-        private const string _dotcomApiUrl = "https://api.github.com";
-        private readonly Dictionary<Guid, ContainerInfo> _cachedActionContainers = new Dictionary<Guid, ContainerInfo>();
 
+        private readonly Dictionary<Guid, ContainerInfo> _cachedActionContainers = new();
         public Dictionary<Guid, ContainerInfo> CachedActionContainers => _cachedActionContainers;
-        public async Task<PrepareResult> PrepareActionsAsync(IExecutionContext executionContext, IEnumerable<Pipelines.JobStep> steps)
+
+        private readonly Dictionary<Guid, List<Pipelines.ActionStep>> _cachedEmbeddedPreSteps = new();
+        public Dictionary<Guid, List<Pipelines.ActionStep>> CachedEmbeddedPreSteps => _cachedEmbeddedPreSteps;
+
+        private readonly Dictionary<Guid, List<Guid>> _cachedEmbeddedStepIds = new();
+        public Dictionary<Guid, List<Guid>> CachedEmbeddedStepIds => _cachedEmbeddedStepIds;
+
+        private readonly Dictionary<Guid, Stack<Pipelines.ActionStep>> _cachedEmbeddedPostSteps = new();
+        public Dictionary<Guid, Stack<Pipelines.ActionStep>> CachedEmbeddedPostSteps => _cachedEmbeddedPostSteps;
+
+        public async Task<PrepareResult> PrepareActionsAsync(IExecutionContext executionContext, IEnumerable<Pipelines.JobStep> steps, Guid rootStepId = default(Guid))
         {
             // Assert inputs
             ArgUtil.NotNull(executionContext, nameof(executionContext));
@@ -64,52 +79,384 @@ namespace GitHub.Runner.Worker
                 PreStepTracker = new Dictionary<Guid, IActionRunner>()
             };
             var containerSetupSteps = new List<JobExtensionRunner>();
-            IOUtil.DeleteDirectory(HostContext.GetDirectory(WellKnownDirectory.Actions), executionContext.CancellationToken);
+            var batchActionResolution = (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.BatchActionResolution) ?? false)
+                || StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("ACTIONS_BATCH_ACTION_RESOLUTION"));
+            // Stack-local cache: same action (owner/repo@ref) is resolved only once,
+            // even if it appears at multiple depths in a composite tree.
+            var resolvedDownloadInfos = batchActionResolution
+                ? new Dictionary<string, WebApi.ActionDownloadInfo>(StringComparer.Ordinal)
+                : null;
+            var depth = 0;
+            // We are running at the start of a job
+            if (rootStepId == default(Guid))
+            {
+                IOUtil.DeleteDirectory(HostContext.GetDirectory(WellKnownDirectory.Actions), executionContext.CancellationToken);
+            }
+            // We are running mid job due to a local composite action
+            else
+            {
+                if (!_cachedEmbeddedStepIds.ContainsKey(rootStepId))
+                {
+                    _cachedEmbeddedStepIds[rootStepId] = new List<Guid>();
+                    foreach (var compositeStep in steps)
+                    {
+                        var guid = Guid.NewGuid();
+                        compositeStep.Id = guid;
+                        _cachedEmbeddedStepIds[rootStepId].Add(guid);
+                    }
+                }
+                depth = 1;
+            }
             IEnumerable<Pipelines.ActionStep> actions = steps.OfType<Pipelines.ActionStep>();
             executionContext.Output("Prepare all required actions");
-            var result = await PrepareActionsRecursiveAsync(executionContext, state, actions, 0);
-            if (state.ImagesToPull.Count > 0)
+            PrepareActionsState result = new PrepareActionsState();
+            try
             {
-                foreach (var imageToPull in result.ImagesToPull)
-                {
-                    Trace.Info($"{imageToPull.Value.Count} steps need to pull image '{imageToPull.Key}'");
-                    containerSetupSteps.Add(new JobExtensionRunner(runAsync: this.PullActionContainerAsync,
-                                                                   condition: $"{PipelineTemplateConstants.Success}()",
-                                                                   displayName: $"Pull {imageToPull.Key}",
-                                                                   data: new ContainerSetupInfo(imageToPull.Value, imageToPull.Key)));
-                }
+                result = batchActionResolution
+                    ? await PrepareActionsRecursiveAsync(executionContext, state, actions, resolvedDownloadInfos, depth, rootStepId)
+                    : await PrepareActionsRecursiveLegacyAsync(executionContext, state, actions, depth, rootStepId);
             }
+            catch (FailedToResolveActionDownloadInfoException ex)
+            {
+                // Log the error and fail the PrepareActionsAsync Initialization.
+                Trace.Error($"Caught exception from PrepareActionsAsync Initialization: {ex}");
+                executionContext.InfrastructureError(ex.InnerException?.Message ?? ex.Message, category: "resolve_action");
+                executionContext.Result = TaskResult.Failed;
+                throw;
+            }
+            catch (FailedToDownloadActionException ex)
+            {
+                // Log the error and fail the PrepareActionsAsync Initialization.
+                Trace.Error($"Caught exception from PrepareActionsAsync Initialization: {ex}");
+                executionContext.InfrastructureError(ex.InnerException?.Message ?? ex.Message, category: "error_download_action");
+                executionContext.Result = TaskResult.Failed;
+                throw;
+            }
+            catch (InvalidActionArchiveException ex)
+            {
+                // Log the error and fail the PrepareActionsAsync Initialization.
+                Trace.Error($"Caught exception from PrepareActionsAsync Initialization: {ex}");
+                executionContext.InfrastructureError(ex.Message, category: "invalid_action_download");
+                executionContext.Result = TaskResult.Failed;
+                throw;
+            }
+            if (!FeatureManager.IsContainerHooksEnabled(executionContext.Global.Variables))
+            {
+                if (state.ImagesToPull.Count > 0)
+                {
+                    foreach (var imageToPull in result.ImagesToPull)
+                    {
+                        Trace.Info($"{imageToPull.Value.Count} steps need to pull image '{imageToPull.Key}'");
+                        containerSetupSteps.Add(new JobExtensionRunner(runAsync: this.PullActionContainerAsync,
+                                                                    condition: $"{PipelineTemplateConstants.Success}()",
+                                                                    displayName: $"Pull {imageToPull.Key}",
+                                                                    data: new ContainerSetupInfo(imageToPull.Value, imageToPull.Key)));
+                    }
+                }
 
-            if (result.ImagesToBuild.Count > 0)
-            {
-                foreach (var imageToBuild in result.ImagesToBuild)
+                if (result.ImagesToBuild.Count > 0)
                 {
-                    var setupInfo = result.ImagesToBuildInfo[imageToBuild.Key];
-                    Trace.Info($"{imageToBuild.Value.Count} steps need to build image from '{setupInfo.Dockerfile}'");
-                    containerSetupSteps.Add(new JobExtensionRunner(runAsync: this.BuildActionContainerAsync,
-                                                                   condition: $"{PipelineTemplateConstants.Success}()",
-                                                                   displayName: $"Build {setupInfo.ActionRepository}",
-                                                                   data: new ContainerSetupInfo(imageToBuild.Value, setupInfo.Dockerfile, setupInfo.WorkingDirectory)));
+                    foreach (var imageToBuild in result.ImagesToBuild)
+                    {
+                        var setupInfo = result.ImagesToBuildInfo[imageToBuild.Key];
+                        Trace.Info($"{imageToBuild.Value.Count} steps need to build image from '{setupInfo.Dockerfile}'");
+                        containerSetupSteps.Add(new JobExtensionRunner(runAsync: this.BuildActionContainerAsync,
+                                                                    condition: $"{PipelineTemplateConstants.Success}()",
+                                                                    displayName: $"Build {setupInfo.ActionRepository}",
+                                                                    data: new ContainerSetupInfo(imageToBuild.Value, setupInfo.Dockerfile, setupInfo.WorkingDirectory)));
+                    }
                 }
-            }
 
 #if !OS_LINUX
-            if (containerSetupSteps.Count > 0)
-            {
-                executionContext.Output("Container action is only supported on Linux, skip pull and build docker images.");
-                containerSetupSteps.Clear();
-            }
+                if (containerSetupSteps.Count > 0)
+                {
+                    executionContext.Output("Container action is only supported on Linux, skip pull and build docker images.");
+                    containerSetupSteps.Clear();
+                }
 #endif
+            }
             return new PrepareResult(containerSetupSteps, result.PreStepTracker);
         }
 
-        private async Task<PrepareActionsState> PrepareActionsRecursiveAsync(IExecutionContext executionContext, PrepareActionsState state, IEnumerable<Pipelines.ActionStep> actions, Int32 depth = 0)
+        private async Task<PrepareActionsState> PrepareActionsRecursiveAsync(IExecutionContext executionContext, PrepareActionsState state, IEnumerable<Pipelines.ActionStep> actions, Dictionary<string, WebApi.ActionDownloadInfo> resolvedDownloadInfos, Int32 depth = 0, Guid parentStepId = default(Guid), string selfRepoName = null, string selfRepoRef = null)
         {
             ArgUtil.NotNull(executionContext, nameof(executionContext));
             if (depth > Constants.CompositeActionsMaxDepth)
             {
                 throw new Exception($"Composite action depth exceeded max depth {Constants.CompositeActionsMaxDepth}");
             }
+
+            // Resolve self-repository ($/) references before processing
+            if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SelfRepository) == true)
+            {
+                if (string.IsNullOrEmpty(selfRepoName))
+                {
+                    // job.workflow_repository/workflow_sha point to the repo
+                    // containing the workflow file — correct for both regular
+                    // and reusable workflows. Always present when the server
+                    // supports $/. See: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context
+                    selfRepoName = executionContext.JobContext?.WorkflowRepository;
+                    selfRepoRef = executionContext.JobContext?.WorkflowSha;
+                }
+                ResolveSelfRepositoryReferences(executionContext, actions, selfRepoName, selfRepoRef);
+            }
+
+            var repositoryActions = new List<Pipelines.ActionStep>();
+
+            foreach (var action in actions)
+            {
+                if (action.Reference.Type == Pipelines.ActionSourceType.ContainerRegistry)
+                {
+                    ArgUtil.NotNull(action, nameof(action));
+                    var containerReference = action.Reference as Pipelines.ContainerRegistryReference;
+                    ArgUtil.NotNull(containerReference, nameof(containerReference));
+                    ArgUtil.NotNullOrEmpty(containerReference.Image, nameof(containerReference.Image));
+
+                    if (!state.ImagesToPull.ContainsKey(containerReference.Image))
+                    {
+                        state.ImagesToPull[containerReference.Image] = new List<Guid>();
+                    }
+
+                    Trace.Info($"Action {action.Name} ({action.Id}) needs to pull image '{containerReference.Image}'");
+                    state.ImagesToPull[containerReference.Image].Add(action.Id);
+                }
+                else if (action.Reference.Type == Pipelines.ActionSourceType.Repository)
+                {
+                    repositoryActions.Add(action);
+                }
+            }
+
+            if (repositoryActions.Count > 0)
+            {
+                // Resolve download info, skipping any actions already cached.
+                await ResolveNewActionsAsync(executionContext, repositoryActions, resolvedDownloadInfos);
+
+                // Download each action.
+                foreach (var action in repositoryActions)
+                {
+                    var lookupKey = GetDownloadInfoLookupKey(action);
+                    if (string.IsNullOrEmpty(lookupKey))
+                    {
+                        continue;
+                    }
+                    if (!resolvedDownloadInfos.TryGetValue(lookupKey, out var downloadInfo))
+                    {
+                        throw new Exception($"Missing download info for {lookupKey}");
+                    }
+
+                    Exception downloadFailure = null;
+                    try
+                    {
+                        await DownloadRepositoryActionAsync(executionContext, downloadInfo);
+                    }
+                    catch (Exception ex)
+                    {
+                        // record the exception for telemetry, and rethrow the original exception to fail the step.
+                        downloadFailure = ex;
+                        throw;
+                    }
+                    finally
+                    {
+                        executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                        {
+                            Type = JobTelemetryType.General,
+                            Message = $"resolve_download_actions_telemetry:{StringUtil.ConvertToJson(new ActionTelemetryPayload
+                            {
+                                Operation = "download_action",
+                                Result = downloadFailure == null ? "succeeded" : downloadFailure.GetType().Name
+                            }, Newtonsoft.Json.Formatting.None)}"
+                        });
+                    }
+                }
+
+                // Parse action.yml and collect composite sub-actions for batched
+                // resolution below. Pre/post step registration is deferred until
+                // after recursion so that HasPre/HasPost reflect the full subtree.
+                var nextLevel = new List<(Pipelines.ActionStep action, Guid parentId)>();
+
+                foreach (var action in repositoryActions)
+                {
+                    var setupInfo = PrepareRepositoryActionAsync(executionContext, action);
+                    if (setupInfo != null && setupInfo.Container != null)
+                    {
+                        if (!string.IsNullOrEmpty(setupInfo.Container.Image))
+                        {
+                            if (!state.ImagesToPull.ContainsKey(setupInfo.Container.Image))
+                            {
+                                state.ImagesToPull[setupInfo.Container.Image] = new List<Guid>();
+                            }
+
+                            Trace.Info($"Action {action.Name} ({action.Id}) from repository '{setupInfo.Container.ActionRepository}' needs to pull image '{setupInfo.Container.Image}'");
+                            state.ImagesToPull[setupInfo.Container.Image].Add(action.Id);
+                        }
+                        else
+                        {
+                            ArgUtil.NotNullOrEmpty(setupInfo.Container.ActionRepository, nameof(setupInfo.Container.ActionRepository));
+
+                            if (!state.ImagesToBuild.ContainsKey(setupInfo.Container.ActionRepository))
+                            {
+                                state.ImagesToBuild[setupInfo.Container.ActionRepository] = new List<Guid>();
+                            }
+
+                            Trace.Info($"Action {action.Name} ({action.Id}) from repository '{setupInfo.Container.ActionRepository}' needs to build image '{setupInfo.Container.Dockerfile}'");
+                            state.ImagesToBuild[setupInfo.Container.ActionRepository].Add(action.Id);
+                            state.ImagesToBuildInfo[setupInfo.Container.ActionRepository] = setupInfo.Container;
+                        }
+                    }
+                    else if (setupInfo != null && setupInfo.Steps != null && setupInfo.Steps.Count > 0)
+                    {
+                        foreach (var step in setupInfo.Steps)
+                        {
+                            nextLevel.Add((step, action.Id));
+                        }
+                    }
+                }
+
+                // Resolve all next-level sub-actions in one batch API call,
+                // then recurse per parent (which hits the cache, not the API).
+                if (nextLevel.Count > 0)
+                {
+                    if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SelfRepository) == true)
+                    {
+                        // Self-repository path: group by parent so each group's
+                        // $/ refs resolve against the correct parent repo context.
+                        var groups = nextLevel.GroupBy(x => x.parentId).Select(group =>
+                        {
+                            string childRepoName = selfRepoName;
+                            string childRepoRef = selfRepoRef;
+                            var parentAction = repositoryActions.FirstOrDefault(a => a.Id == group.Key);
+                            if (parentAction?.Reference is Pipelines.RepositoryPathReference parentRef &&
+                                string.Equals(parentRef.RepositoryType, Pipelines.RepositoryTypes.GitHub, StringComparison.OrdinalIgnoreCase))
+                            {
+                                childRepoName = parentRef.Name;
+                                childRepoRef = parentRef.Ref;
+                            }
+                            return new { ParentId = group.Key, Actions = group.Select(x => x.action).ToList(), RepoName = childRepoName, RepoRef = childRepoRef };
+                        }).ToList();
+
+                        foreach (var group in groups)
+                        {
+                            ResolveSelfRepositoryReferences(executionContext, group.Actions, group.RepoName, group.RepoRef);
+                        }
+
+                        var nextLevelRepoActions = nextLevel
+                            .Where(x => x.action.Reference.Type == Pipelines.ActionSourceType.Repository)
+                            .Select(x => x.action)
+                            .ToList();
+                        await ResolveNewActionsAsync(executionContext, nextLevelRepoActions, resolvedDownloadInfos);
+
+                        foreach (var group in groups)
+                        {
+                            state = await PrepareActionsRecursiveAsync(executionContext, state, group.Actions, resolvedDownloadInfos, depth + 1, group.ParentId, group.RepoName, group.RepoRef);
+                        }
+                    }
+                    else
+                    {
+                        // Original path: no self-repository resolution needed.
+                        var nextLevelActions = nextLevel.Select(x => x.action).ToList();
+                        var nextLevelRepoActions = nextLevelActions
+                            .Where(x => x.Reference.Type == Pipelines.ActionSourceType.Repository)
+                            .ToList();
+                        await ResolveNewActionsAsync(executionContext, nextLevelRepoActions, resolvedDownloadInfos);
+
+                        foreach (var grp in nextLevel.GroupBy(x => x.parentId))
+                        {
+                            state = await PrepareActionsRecursiveAsync(executionContext, state, grp.Select(x => x.action).ToList(), resolvedDownloadInfos, depth + 1, grp.Key);
+                        }
+                    }
+                }
+
+                // Register pre/post steps after recursion so that HasPre/HasPost
+                // are correct (they depend on _cachedEmbeddedPreSteps/PostSteps
+                // being populated by the recursive calls above).
+                foreach (var action in repositoryActions)
+                {
+                    var repoAction = action.Reference as Pipelines.RepositoryPathReference;
+                    if (repoAction.RepositoryType != Pipelines.PipelineConstants.SelfAlias)
+                    {
+                        var definition = LoadAction(executionContext, action);
+                        if (definition.Data.Execution.HasPre)
+                        {
+                            Trace.Info($"Add 'pre' execution for {action.Id}");
+                            // Root Step
+                            if (depth < 1)
+                            {
+                                var actionRunner = HostContext.CreateService<IActionRunner>();
+                                actionRunner.Action = action;
+                                actionRunner.Stage = ActionRunStage.Pre;
+                                actionRunner.Condition = definition.Data.Execution.InitCondition;
+                                state.PreStepTracker[action.Id] = actionRunner;
+                            }
+                            // Embedded Step
+                            else
+                            {
+                                if (!_cachedEmbeddedPreSteps.ContainsKey(parentStepId))
+                                {
+                                    _cachedEmbeddedPreSteps[parentStepId] = new List<Pipelines.ActionStep>();
+                                }
+                                // Clone action so we can modify the condition without affecting the original
+                                var clonedAction = action.Clone() as Pipelines.ActionStep;
+                                clonedAction.Condition = definition.Data.Execution.InitCondition;
+                                _cachedEmbeddedPreSteps[parentStepId].Add(clonedAction);
+                            }
+                        }
+
+                        if (definition.Data.Execution.HasPost && depth > 0)
+                        {
+                            if (!_cachedEmbeddedPostSteps.ContainsKey(parentStepId))
+                            {
+                                // If we haven't done so already, add the parent to the post steps
+                                _cachedEmbeddedPostSteps[parentStepId] = new Stack<Pipelines.ActionStep>();
+                            }
+                            // Clone action so we can modify the condition without affecting the original
+                            var clonedAction = action.Clone() as Pipelines.ActionStep;
+                            clonedAction.Condition = definition.Data.Execution.CleanupCondition;
+                            _cachedEmbeddedPostSteps[parentStepId].Push(clonedAction);
+                        }
+                    }
+                    else if (depth > 0)
+                    {
+                        // if we're in a composite action and haven't loaded the local action yet
+                        // we assume it has a post step
+                        if (!_cachedEmbeddedPostSteps.ContainsKey(parentStepId))
+                        {
+                            // If we haven't done so already, add the parent to the post steps
+                            _cachedEmbeddedPostSteps[parentStepId] = new Stack<Pipelines.ActionStep>();
+                        }
+                        // Clone action so we can modify the condition without affecting the original
+                        var clonedAction = action.Clone() as Pipelines.ActionStep;
+                        _cachedEmbeddedPostSteps[parentStepId].Push(clonedAction);
+                    }
+                }
+            }
+
+            return state;
+        }
+
+        /// <summary>
+        /// Legacy (non-batched) action resolution. Each composite resolves its
+        /// sub-actions individually, with no cross-depth deduplication.
+        /// Used when the BatchActionResolution feature flag is disabled.
+        /// </summary>
+        private async Task<PrepareActionsState> PrepareActionsRecursiveLegacyAsync(IExecutionContext executionContext, PrepareActionsState state, IEnumerable<Pipelines.ActionStep> actions, Int32 depth = 0, Guid parentStepId = default(Guid), string selfRepoName = null, string selfRepoRef = null)
+        {
+            ArgUtil.NotNull(executionContext, nameof(executionContext));
+            if (depth > Constants.CompositeActionsMaxDepth)
+            {
+                throw new Exception($"Composite action depth exceeded max depth {Constants.CompositeActionsMaxDepth}");
+            }
+
+            // Resolve self-repository ($/) references before processing
+            if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SelfRepository) == true)
+            {
+                if (string.IsNullOrEmpty(selfRepoName))
+                {
+                    selfRepoName = executionContext.JobContext?.WorkflowRepository;
+                    selfRepoRef = executionContext.JobContext?.WorkflowSha;
+                }
+                ResolveSelfRepositoryReferences(executionContext, actions, selfRepoName, selfRepoRef);
+            }
+
             var repositoryActions = new List<Pipelines.ActionStep>();
 
             foreach (var action in actions)
@@ -138,7 +485,30 @@ namespace GitHub.Runner.Worker
             if (repositoryActions.Count > 0)
             {
                 // Get the download info
-                var downloadInfos = await GetDownloadInfoAsync(executionContext, repositoryActions);
+                IDictionary<string, WebApi.ActionDownloadInfo> downloadInfos = null;
+                Exception resolveFailure = null;
+                try
+                {
+                    downloadInfos = await GetDownloadInfoAsync(executionContext, repositoryActions);
+                }
+                catch (Exception ex)
+                {
+                    // record the exception for telemetry, and rethrow the original exception to fail the step.
+                    resolveFailure = ex;
+                    throw;
+                }
+                finally
+                {
+                    executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                    {
+                        Type = JobTelemetryType.General,
+                        Message = $"resolve_download_actions_telemetry:{StringUtil.ConvertToJson(new ActionTelemetryPayload
+                        {
+                            Operation = "resolve_actions",
+                            Result = resolveFailure == null ? "succeeded" : resolveFailure.GetType().Name
+                        }, Newtonsoft.Json.Formatting.None)}"
+                    });
+                }
 
                 // Download each action
                 foreach (var action in repositoryActions)
@@ -154,7 +524,29 @@ namespace GitHub.Runner.Worker
                         throw new Exception($"Missing download info for {lookupKey}");
                     }
 
-                    await DownloadRepositoryActionAsync(executionContext, downloadInfo);
+                    Exception downloadFailure = null;
+                    try
+                    {
+                        await DownloadRepositoryActionAsync(executionContext, downloadInfo);
+                    }
+                    catch (Exception ex)
+                    {
+                        // record the exception for telemetry, and rethrow the original exception to fail the step.
+                        downloadFailure = ex;
+                        throw;
+                    }
+                    finally
+                    {
+                        executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                        {
+                            Type = JobTelemetryType.General,
+                            Message = $"resolve_download_actions_telemetry:{StringUtil.ConvertToJson(new ActionTelemetryPayload
+                            {
+                                Operation = "download_action",
+                                Result = downloadFailure == null ? "succeeded" : downloadFailure.GetType().Name
+                            }, Newtonsoft.Json.Formatting.None)}"
+                        });
+                    }
                 }
 
                 // More preparation based on content in the repository (action.yml)
@@ -187,25 +579,75 @@ namespace GitHub.Runner.Worker
                             state.ImagesToBuildInfo[setupInfo.Container.ActionRepository] = setupInfo.Container;
                         }
                     }
-                    else if(setupInfo != null && setupInfo.Steps != null && setupInfo.Steps.Count > 0)
+                    else if (setupInfo != null && setupInfo.Steps != null && setupInfo.Steps.Count > 0)
                     {
-                        state = await PrepareActionsRecursiveAsync(executionContext, state, setupInfo.Steps, depth + 1);
+                        // Propagate parent's repo context for nested self-repository resolution
+                        var parentRef = action.Reference as Pipelines.RepositoryPathReference;
+                        var childRepoName = selfRepoName;
+                        var childRepoRef = selfRepoRef;
+                        if (parentRef != null &&
+                            string.Equals(parentRef.RepositoryType, Pipelines.RepositoryTypes.GitHub, StringComparison.OrdinalIgnoreCase))
+                        {
+                            childRepoName = parentRef.Name;
+                            childRepoRef = parentRef.Ref;
+                        }
+                        state = await PrepareActionsRecursiveLegacyAsync(executionContext, state, setupInfo.Steps, depth + 1, action.Id, childRepoName, childRepoRef);
                     }
                     var repoAction = action.Reference as Pipelines.RepositoryPathReference;
                     if (repoAction.RepositoryType != Pipelines.PipelineConstants.SelfAlias)
                     {
                         var definition = LoadAction(executionContext, action);
-                        // TODO: Support pre's in composite actions
-                        if (definition.Data.Execution.HasPre && depth < 1)
+                        if (definition.Data.Execution.HasPre)
                         {
-                            var actionRunner = HostContext.CreateService<IActionRunner>();
-                            actionRunner.Action = action;
-                            actionRunner.Stage = ActionRunStage.Pre;
-                            actionRunner.Condition = definition.Data.Execution.InitCondition;
-
                             Trace.Info($"Add 'pre' execution for {action.Id}");
-                            state.PreStepTracker[action.Id] = actionRunner;
+                            // Root Step
+                            if (depth < 1)
+                            {
+                                var actionRunner = HostContext.CreateService<IActionRunner>();
+                                actionRunner.Action = action;
+                                actionRunner.Stage = ActionRunStage.Pre;
+                                actionRunner.Condition = definition.Data.Execution.InitCondition;
+                                state.PreStepTracker[action.Id] = actionRunner;
+                            }
+                            // Embedded Step
+                            else
+                            {
+                                if (!_cachedEmbeddedPreSteps.ContainsKey(parentStepId))
+                                {
+                                    _cachedEmbeddedPreSteps[parentStepId] = new List<Pipelines.ActionStep>();
+                                }
+                                // Clone action so we can modify the condition without affecting the original
+                                var clonedAction = action.Clone() as Pipelines.ActionStep;
+                                clonedAction.Condition = definition.Data.Execution.InitCondition;
+                                _cachedEmbeddedPreSteps[parentStepId].Add(clonedAction);
+                            }
                         }
+
+                        if (definition.Data.Execution.HasPost && depth > 0)
+                        {
+                            if (!_cachedEmbeddedPostSteps.ContainsKey(parentStepId))
+                            {
+                                // If we haven't done so already, add the parent to the post steps
+                                _cachedEmbeddedPostSteps[parentStepId] = new Stack<Pipelines.ActionStep>();
+                            }
+                            // Clone action so we can modify the condition without affecting the original
+                            var clonedAction = action.Clone() as Pipelines.ActionStep;
+                            clonedAction.Condition = definition.Data.Execution.CleanupCondition;
+                            _cachedEmbeddedPostSteps[parentStepId].Push(clonedAction);
+                        }
+                    }
+                    else if (depth > 0)
+                    {
+                        // if we're in a composite action and haven't loaded the local action yet
+                        // we assume it has a post step
+                        if (!_cachedEmbeddedPostSteps.ContainsKey(parentStepId))
+                        {
+                            // If we haven't done so already, add the parent to the post steps
+                            _cachedEmbeddedPostSteps[parentStepId] = new Stack<Pipelines.ActionStep>();
+                        }
+                        // Clone action so we can modify the condition without affecting the original
+                        var clonedAction = action.Clone() as Pipelines.ActionStep;
+                        _cachedEmbeddedPostSteps[parentStepId].Push(clonedAction);
                     }
                 }
             }
@@ -227,15 +669,28 @@ namespace GitHub.Runner.Worker
 
             if (action.Reference.Type == Pipelines.ActionSourceType.ContainerRegistry)
             {
-                Trace.Info("Load action that reference container from registry.");
-                CachedActionContainers.TryGetValue(action.Id, out var container);
-                ArgUtil.NotNull(container, nameof(container));
-                definition.Data.Execution = new ContainerActionExecutionData()
+                if (FeatureManager.IsContainerHooksEnabled(executionContext.Global.Variables))
                 {
-                    Image = container.ContainerImage
-                };
+                    Trace.Info("Load action that will run container through container hooks.");
+                    var containerAction = action.Reference as Pipelines.ContainerRegistryReference;
+                    definition.Data.Execution = new ContainerActionExecutionData()
+                    {
+                        Image = containerAction.Image,
+                    };
+                    Trace.Info($"Using action container image: {containerAction.Image}.");
+                }
+                else
+                {
+                    Trace.Info("Load action that reference container from registry.");
+                    CachedActionContainers.TryGetValue(action.Id, out var container);
+                    ArgUtil.NotNull(container, nameof(container));
+                    definition.Data.Execution = new ContainerActionExecutionData()
+                    {
+                        Image = container.ContainerImage
+                    };
 
-                Trace.Info($"Using action container image: {container.ContainerImage}.");
+                    Trace.Info($"Using action container image: {container.ContainerImage}.");
+                }
             }
             else if (action.Reference.Type == Pipelines.ActionSourceType.Repository)
             {
@@ -248,6 +703,12 @@ namespace GitHub.Runner.Worker
                     {
                         actionDirectory = Path.Combine(actionDirectory, repoAction.Path);
                     }
+                }
+                else if (string.Equals(repoAction.RepositoryType, Pipelines.PipelineConstants.SelfRepositoryAlias, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Unresolved self-repository reference at load time — this
+                    // shouldn't happen but guard against NRE if it does.
+                    throw new InvalidOperationException($"Self-repository reference '$/{repoAction.Path}' was not resolved before LoadAction. Ensure the '{Constants.Runner.Features.SelfRepository}' feature flag is enabled.");
                 }
                 else
                 {
@@ -267,7 +728,7 @@ namespace GitHub.Runner.Worker
                 string dockerFileLowerCase = Path.Combine(actionDirectory, "dockerfile");
                 if (File.Exists(manifestFile) || File.Exists(manifestFileYaml))
                 {
-                    var manifestManager = HostContext.GetService<IActionManifestManager>();
+                    var manifestManager = HostContext.GetService<IActionManifestManagerWrapper>();
                     if (File.Exists(manifestFile))
                     {
                         definition.Data = manifestManager.Load(executionContext, manifestFile);
@@ -355,6 +816,56 @@ namespace GitHub.Runner.Worker
                         Trace.Verbose($"Details: {StringUtil.ConvertToJson(compositeAction?.Steps)}");
                         Trace.Info($"Load: {compositeAction.Outputs?.Count ?? 0} number of outputs");
                         Trace.Info($"Details: {StringUtil.ConvertToJson(compositeAction?.Outputs)}");
+
+                        if (CachedEmbeddedPreSteps.TryGetValue(action.Id, out var preSteps))
+                        {
+                            compositeAction.PreSteps = preSteps;
+                        }
+
+                        if (CachedEmbeddedPostSteps.TryGetValue(action.Id, out var postSteps))
+                        {
+                            compositeAction.PostSteps = postSteps;
+                        }
+
+                        if (_cachedEmbeddedStepIds.ContainsKey(action.Id))
+                        {
+                            for (var i = 0; i < compositeAction.Steps.Count; i++)
+                            {
+                                // Load stored Ids for later load actions
+                                compositeAction.Steps[i].Id = _cachedEmbeddedStepIds[action.Id][i];
+                            }
+                        }
+                        else
+                        {
+                            _cachedEmbeddedStepIds[action.Id] = new List<Guid>();
+                            foreach (var compositeStep in compositeAction.Steps)
+                            {
+                                var guid = Guid.NewGuid();
+                                compositeStep.Id = guid;
+                                _cachedEmbeddedStepIds[action.Id].Add(guid);
+                            }
+                        }
+
+                        // Resolve self-repository refs in composite steps at load time.
+                        // During setup, resolution happens on a separate copy of these
+                        // step objects. At runtime, action.yml is re-parsed, producing
+                        // fresh self-repository refs that need resolution here.
+                        // When the parent is a dot-slash (self local-workspace) action,
+                        // repoAction.Name/Ref are null — fall back to workflow context.
+                        if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SelfRepository) == true)
+                        {
+                            var parentName = repoAction.Name ?? executionContext.JobContext?.WorkflowRepository;
+                            var parentRef = repoAction.Ref ?? executionContext.JobContext?.WorkflowSha;
+                            ResolveSelfRepositoryReferences(executionContext, compositeAction.Steps, parentName, parentRef);
+                            if (compositeAction.PreSteps != null)
+                            {
+                                ResolveSelfRepositoryReferences(executionContext, compositeAction.PreSteps, parentName, parentRef);
+                            }
+                            if (compositeAction.PostSteps != null)
+                            {
+                                ResolveSelfRepositoryReferences(executionContext, compositeAction.PostSteps, parentName, parentRef);
+                            }
+                        }
                     }
                     else
                     {
@@ -527,6 +1038,7 @@ namespace GitHub.Runner.Worker
                     {
                         NameWithOwner = repositoryReference.Name,
                         Ref = repositoryReference.Ref,
+                        Path = repositoryReference.Path,
                     };
                 })
                 .ToList();
@@ -537,19 +1049,39 @@ namespace GitHub.Runner.Worker
                 return new Dictionary<string, WebApi.ActionDownloadInfo>();
             }
 
+            // Pass lockfile dependencies to Launch when present, so it can
+            // perform ref-scoped policy matching with the original refs.
+            var deps = executionContext.Global.ActionsDependencies;
+            IList<string> dependencies = (deps != null && deps.Count > 0) ? deps : null;
+
             // Resolve download info
+            var launchServer = HostContext.GetService<ILaunchServer>();
             var jobServer = HostContext.GetService<IJobServer>();
             var actionDownloadInfos = default(WebApi.ActionDownloadInfoCollection);
             for (var attempt = 1; attempt <= 3; attempt++)
             {
                 try
                 {
-                    actionDownloadInfos = await jobServer.ResolveActionDownloadInfoAsync(executionContext.Global.Plan.ScopeIdentifier, executionContext.Global.Plan.PlanType, executionContext.Global.Plan.PlanId, new WebApi.ActionReferenceList { Actions = actionReferences }, executionContext.CancellationToken);
+                    if (MessageUtil.IsRunServiceJob(executionContext.Global.Variables.Get(Constants.Variables.System.JobRequestType)))
+                    {
+                        var displayHelpfulActionsDownloadErrors = executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.DisplayHelpfulActionsDownloadErrors) ?? false;
+                        actionDownloadInfos = await launchServer.ResolveActionsDownloadInfoAsync(executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences, Dependencies = dependencies }, executionContext.CancellationToken, displayHelpfulActionsDownloadErrors);
+                    }
+                    else
+                    {
+                        actionDownloadInfos = await jobServer.ResolveActionDownloadInfoAsync(executionContext.Global.Plan.ScopeIdentifier, executionContext.Global.Plan.PlanType, executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences }, executionContext.CancellationToken);
+                    }
                     break;
                 }
-                catch (Exception ex) when (!executionContext.CancellationToken.IsCancellationRequested) // Do not retry if the run is canceled.
+                catch (Exception ex) when (!executionContext.CancellationToken.IsCancellationRequested) // Do not retry if the run is cancelled.
                 {
-                    if (attempt < 3)
+                    // UnresolvableActionDownloadInfoException is a 422 client error, don't retry
+                    // NonRetryableActionDownloadInfoException is an non-retryable exception from Actions
+                    // Some possible cases are:
+                    // * Repo is rate limited
+                    // * Repo or tag doesn't exist, or isn't public
+                    // * Policy validation failed
+                    if (attempt < 3 && !(ex is WebApi.UnresolvableActionDownloadInfoException) && !(ex is WebApi.NonRetryableActionDownloadInfoException))
                     {
                         executionContext.Output($"Failed to resolve action download info. Error: {ex.Message}");
                         executionContext.Debug(ex.ToString());
@@ -565,6 +1097,7 @@ namespace GitHub.Runner.Worker
                         // Some possible cases are:
                         // * Repo is rate limited
                         // * Repo or tag doesn't exist, or isn't public
+                        // * Policy validation failed
                         if (ex is WebApi.UnresolvableActionDownloadInfoException)
                         {
                             throw;
@@ -580,10 +1113,7 @@ namespace GitHub.Runner.Worker
 
             ArgUtil.NotNull(actionDownloadInfos, nameof(actionDownloadInfos));
             ArgUtil.NotNull(actionDownloadInfos.Actions, nameof(actionDownloadInfos.Actions));
-            var apiUrl = GetApiUrl(executionContext);
             var defaultAccessToken = executionContext.GetGitHubContext("token");
-            var configurationStore = HostContext.GetService<IConfigurationStore>();
-            var runnerSettings = configurationStore.GetSettings();
 
             foreach (var actionDownloadInfo in actionDownloadInfos.Actions.Values)
             {
@@ -600,6 +1130,56 @@ namespace GitHub.Runner.Worker
             return actionDownloadInfos.Actions;
         }
 
+        /// <summary>
+        /// Only resolves actions not already in resolvedDownloadInfos.
+        /// Results are cached for reuse at deeper recursion levels.
+        /// </summary>
+        private async Task ResolveNewActionsAsync(IExecutionContext executionContext, List<Pipelines.ActionStep> actions, Dictionary<string, WebApi.ActionDownloadInfo> resolvedDownloadInfos)
+        {
+            var actionsToResolve = new List<Pipelines.ActionStep>();
+            var pendingKeys = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var action in actions)
+            {
+                var lookupKey = GetDownloadInfoLookupKey(action);
+                if (!string.IsNullOrEmpty(lookupKey) && !resolvedDownloadInfos.ContainsKey(lookupKey) && pendingKeys.Add(lookupKey))
+                {
+                    actionsToResolve.Add(action);
+                }
+            }
+
+            if (actionsToResolve.Count > 0)
+            {
+                IDictionary<string, WebApi.ActionDownloadInfo> downloadInfos = null;
+                Exception resolveFailure = null;
+                try
+                {
+                    downloadInfos = await GetDownloadInfoAsync(executionContext, actionsToResolve);
+                    foreach (var kvp in downloadInfos)
+                    {
+                        resolvedDownloadInfos[kvp.Key] = kvp.Value;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // record the exception for telemetry, and rethrow the original exception to fail the step.
+                    resolveFailure = ex;
+                    throw;
+                }
+                finally
+                {
+                    executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                    {
+                        Type = JobTelemetryType.General,
+                        Message = $"resolve_download_actions_telemetry:{StringUtil.ConvertToJson(new ActionTelemetryPayload
+                        {
+                            Operation = "resolve_actions",
+                            Result = resolveFailure == null ? "succeeded" : resolveFailure.GetType().Name
+                        }, Newtonsoft.Json.Formatting.None)}"
+                    });
+                }
+            }
+        }
+
         private async Task DownloadRepositoryActionAsync(IExecutionContext executionContext, WebApi.ActionDownloadInfo downloadInfo)
         {
             Trace.Entering();
@@ -607,6 +1187,8 @@ namespace GitHub.Runner.Worker
             ArgUtil.NotNull(downloadInfo, nameof(downloadInfo));
             ArgUtil.NotNullOrEmpty(downloadInfo.NameWithOwner, nameof(downloadInfo.NameWithOwner));
             ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.Ref));
+            ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedNameWithOwner));
+            ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedSha));
 
             string destDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), downloadInfo.NameWithOwner.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), downloadInfo.Ref);
             string watermarkFile = GetWatermarkFilePath(destDirectory);
@@ -617,37 +1199,20 @@ namespace GitHub.Runner.Worker
             }
             else
             {
-                // make sure we get a clean folder ready to use.
-                IOUtil.DeleteDirectory(destDirectory, executionContext.CancellationToken);
-                Directory.CreateDirectory(destDirectory);
-                executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}'");
+                if (downloadInfo.PackageDetails != null)
+                {
+                    executionContext.Output($"##[group]Download immutable action package '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}'");
+                    executionContext.Output($"Version: {downloadInfo.PackageDetails.Version}");
+                    executionContext.Output($"Digest: {downloadInfo.PackageDetails.ManifestDigest}");
+                    executionContext.Output($"Source commit SHA: {downloadInfo.ResolvedSha}");
+                    executionContext.Output("##[endgroup]");
+                }
+                else
+                {
+                    executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}' (SHA:{downloadInfo.ResolvedSha})");
+                }
             }
 
-            await DownloadRepositoryActionAsync(executionContext, downloadInfo, destDirectory);
-        }
-
-        private string GetApiUrl(IExecutionContext executionContext)
-        {
-            string apiUrl = executionContext.GetGitHubContext("api_url");
-            if (!string.IsNullOrEmpty(apiUrl))
-            {
-                return apiUrl;
-            }
-            // Once the api_url is set for hosted, we can remove this fallback (it doesn't make sense for GHES)
-            return _dotcomApiUrl;
-        }
-
-        private static string BuildLinkToActionArchive(string apiUrl, string repository, string @ref)
-        {
-#if OS_WINDOWS
-            return $"{apiUrl}/repos/{repository}/zipball/{@ref}";
-#else
-            return $"{apiUrl}/repos/{repository}/tarball/{@ref}";
-#endif
-        }
-
-        private async Task DownloadRepositoryActionAsync(IExecutionContext executionContext, WebApi.ActionDownloadInfo downloadInfo, string destDirectory)
-        {
             //download and extract action in a temp folder and rename it on success
             string tempDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), "_temp_" + Guid.NewGuid());
             Directory.CreateDirectory(tempDirectory);
@@ -660,108 +1225,118 @@ namespace GitHub.Runner.Worker
             string link = downloadInfo?.TarballUrl;
 #endif
 
-            Trace.Info($"Save archive '{link}' into {archiveFile}.");
             try
             {
-                int retryCount = 0;
-
-                // Allow up to 20 * 60s for any action to be downloaded from github graph.
-                int timeoutSeconds = 20 * 60;
-                while (retryCount < 3)
+                var useActionArchiveCache = false;
+                var hasActionArchiveCache = false;
+                var actionArchiveCacheDir = Environment.GetEnvironmentVariable(Constants.Variables.Agent.ActionArchiveCacheDirectory);
+                if (!string.IsNullOrEmpty(actionArchiveCacheDir) &&
+                    Directory.Exists(actionArchiveCacheDir))
                 {
-                    using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
-                    using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                    var symlinkCachedActions = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(Constants.Variables.Agent.SymlinkCachedActions));
+                    if (symlinkCachedActions)
+                    {
+                        Trace.Info($"Checking if can symlink '{downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha}'");
+
+                        var cacheDirectory = Path.Combine(actionArchiveCacheDir, downloadInfo.ResolvedNameWithOwner.Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_'), downloadInfo.ResolvedSha);
+                        if (Directory.Exists(cacheDirectory))
+                        {
+                            try
+                            {
+                                Trace.Info($"Found unpacked action directory '{cacheDirectory}' in cache directory '{actionArchiveCacheDir}'");
+
+                                // repository archive from github always contains a nested folder
+                                var nestedDirectories = new DirectoryInfo(cacheDirectory).GetDirectories();
+                                if (nestedDirectories.Length != 1)
+                                {
+                                    throw new InvalidOperationException($"'{cacheDirectory}' contains '{nestedDirectories.Length}' directories");
+                                }
+                                else
+                                {
+                                    executionContext.Debug($"Symlink '{nestedDirectories[0].Name}' to '{destDirectory}'");
+                                    // make sure we get a clean folder ready to use.
+                                    IOUtil.DeleteDirectory(destDirectory, executionContext.CancellationToken);
+                                    IOUtil.CreateSymbolicLink(destDirectory, nestedDirectories[0].FullName);
+                                }
+
+                                executionContext.Debug($"Created symlink from cached directory '{cacheDirectory}' to '{destDirectory}'");
+                                executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                                {
+                                    Type = JobTelemetryType.General,
+                                    Message = $"Action archive cache usage: {downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha} use cache {useActionArchiveCache} has cache {hasActionArchiveCache} via symlink"
+                                });
+
+                                Trace.Info("Finished getting action repository.");
+                                return;
+                            }
+                            catch (Exception ex)
+                            {
+                                Trace.Error($"Failed to create symlink from cached directory '{cacheDirectory}' to '{destDirectory}'. Error: {ex}");
+                                // Fall through to normal download logic
+                            }
+                        }
+                    }
+
+                    hasActionArchiveCache = true;
+                    Trace.Info($"Check if action archive '{downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha}' already exists in cache directory '{actionArchiveCacheDir}'");
+#if OS_WINDOWS
+                    var cacheArchiveFile = Path.Combine(actionArchiveCacheDir, downloadInfo.ResolvedNameWithOwner.Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_'), $"{downloadInfo.ResolvedSha}.zip");
+#else
+                    var cacheArchiveFile = Path.Combine(actionArchiveCacheDir, downloadInfo.ResolvedNameWithOwner.Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_'), $"{downloadInfo.ResolvedSha}.tar.gz");
+#endif
+                    if (File.Exists(cacheArchiveFile))
                     {
                         try
                         {
-                            //open zip stream in async mode
-                            using (FileStream fs = new FileStream(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
-                            using (var httpClientHandler = HostContext.CreateHttpClientHandler())
-                            using (var httpClient = new HttpClient(httpClientHandler))
-                            {
-                                httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(downloadInfo.Authentication?.Token);
-
-                                httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
-                                using (var response = await httpClient.GetAsync(link))
-                                {
-                                    if (response.IsSuccessStatusCode)
-                                    {
-                                        using (var result = await response.Content.ReadAsStreamAsync())
-                                        {
-                                            await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
-                                            await fs.FlushAsync(actionDownloadCancellation.Token);
-
-                                            // download succeed, break out the retry loop.
-                                            break;
-                                        }
-                                    }
-                                    else if (response.StatusCode == HttpStatusCode.NotFound)
-                                    {
-                                        // It doesn't make sense to retry in this case, so just stop
-                                        throw new ActionNotFoundException(new Uri(link));
-                                    }
-                                    else
-                                    {
-                                        // Something else bad happened, let's go to our retry logic
-                                        response.EnsureSuccessStatusCode();
-                                    }
-                                }
-                            }
+                            Trace.Info($"Found action archive '{cacheArchiveFile}' in cache directory '{actionArchiveCacheDir}'");
+                            File.Copy(cacheArchiveFile, archiveFile);
+                            useActionArchiveCache = true;
+                            executionContext.Debug($"Copied action archive '{cacheArchiveFile}' to '{archiveFile}'");
                         }
-                        catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
+                        catch (Exception ex)
                         {
-                            Trace.Info("Action download has been cancelled.");
-                            throw;
+                            Trace.Error($"Failed to copy action archive '{cacheArchiveFile}' to '{archiveFile}'. Error: {ex}");
                         }
-                        catch (ActionNotFoundException)
-                        {
-                            Trace.Info($"The action at '{link}' does not exist");
-                            throw;
-                        }
-                        catch (Exception ex) when (retryCount < 2)
-                        {
-                            retryCount++;
-                            Trace.Error($"Fail to download archive '{link}' -- Attempt: {retryCount}");
-                            Trace.Error(ex);
-                            if (actionDownloadTimeout.Token.IsCancellationRequested)
-                            {
-                                // action download didn't finish within timeout
-                                executionContext.Warning($"Action '{link}' didn't finish download within {timeoutSeconds} seconds.");
-                            }
-                            else
-                            {
-                                executionContext.Warning($"Failed to download action '{link}'. Error: {ex.Message}");
-                            }
-                        }
-                    }
-
-                    if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
-                    {
-                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
-                        executionContext.Warning($"Back off {backOff.TotalSeconds} seconds before retry.");
-                        await Task.Delay(backOff);
                     }
                 }
 
-                ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
-                executionContext.Debug($"Download '{link}' to '{archiveFile}'");
+                if (!useActionArchiveCache)
+                {
+                    await DownloadRepositoryArchive(executionContext, link, downloadInfo.Authentication?.Token, archiveFile);
+                }
 
                 var stagingDirectory = Path.Combine(tempDirectory, "_staging");
                 Directory.CreateDirectory(stagingDirectory);
 
+                var fileInfo = new FileInfo(archiveFile);
+                executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                {
+                    Type = JobTelemetryType.General,
+                    Message = $"Action archive cache usage: {downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha} use cache {useActionArchiveCache} has cache {hasActionArchiveCache} size {fileInfo.Length} bytes"
+                });
+
 #if OS_WINDOWS
-                ZipFile.ExtractToDirectory(archiveFile, stagingDirectory);
+                try
+                {
+                    ZipFile.ExtractToDirectory(archiveFile, stagingDirectory);
+                }
+                catch (InvalidDataException e)
+                {
+                    throw new InvalidActionArchiveException($"Can't un-zip archive file: {archiveFile}. action being checked out: {downloadInfo.NameWithOwner}@{downloadInfo.Ref}. error: {e}.");
+                }
 #else
                 string tar = WhichUtil.Which("tar", require: true, trace: Trace);
 
                 // tar -xzf
                 using (var processInvoker = HostContext.CreateService<IProcessInvoker>())
                 {
+                    var tarOutputs = new List<string>();
                     processInvoker.OutputDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
                     {
                         if (!string.IsNullOrEmpty(args.Data))
                         {
                             Trace.Info(args.Data);
+                            tarOutputs.Add($"STDOUT: {args.Data}");
                         }
                     });
 
@@ -770,16 +1345,22 @@ namespace GitHub.Runner.Worker
                         if (!string.IsNullOrEmpty(args.Data))
                         {
                             Trace.Error(args.Data);
+                            tarOutputs.Add($"STDERR: {args.Data}");
                         }
                     });
 
                     int exitCode = await processInvoker.ExecuteAsync(stagingDirectory, tar, $"-xzf \"{archiveFile}\"", null, executionContext.CancellationToken);
                     if (exitCode != 0)
                     {
-                        throw new NotSupportedException($"Can't use 'tar -xzf' extract archive file: {archiveFile}. return code: {exitCode}.");
+                        var sha256hash = await IOUtil.GetFileContentSha256HashAsync(archiveFile);
+                        throw new InvalidActionArchiveException($"Can't use 'tar -xzf' extract archive file: {archiveFile} (SHA256 '{sha256hash}', size '{fileInfo.Length}' bytes, tar outputs '{string.Join(' ', tarOutputs)}'). Action being checked out: {downloadInfo.NameWithOwner}@{downloadInfo.Ref}. return code: {exitCode}.");
                     }
                 }
 #endif
+
+                // make sure we get a clean folder ready to use.
+                IOUtil.DeleteDirectory(destDirectory, executionContext.CancellationToken);
+                Directory.CreateDirectory(destDirectory);
 
                 // repository archive from github always contains a nested folder
                 var subDirectories = new DirectoryInfo(stagingDirectory).GetDirectories();
@@ -794,7 +1375,6 @@ namespace GitHub.Runner.Worker
                 }
 
                 Trace.Verbose("Create watermark file indicate action download succeed.");
-                string watermarkFile = GetWatermarkFilePath(destDirectory);
                 File.WriteAllText(watermarkFile, DateTime.UtcNow.ToString());
 
                 executionContext.Debug($"Archive '{archiveFile}' has been unzipped into '{destDirectory}'.");
@@ -819,30 +1399,13 @@ namespace GitHub.Runner.Worker
             }
         }
 
-        private void ConfigureAuthorizationFromContext(IExecutionContext executionContext, HttpClient httpClient)
-        {
-            var authToken = Environment.GetEnvironmentVariable("_GITHUB_ACTION_TOKEN");
-            if (string.IsNullOrEmpty(authToken))
-            {
-                // TODO: Deprecate the PREVIEW_ACTION_TOKEN
-                authToken = executionContext.Global.Variables.Get("PREVIEW_ACTION_TOKEN");
-            }
-
-            if (!string.IsNullOrEmpty(authToken))
-            {
-                HostContext.SecretMasker.AddValue(authToken);
-                var base64EncodingToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"PAT:{authToken}"));
-                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", base64EncodingToken);
-            }
-            else
-            {
-                var accessToken = executionContext.GetGitHubContext("token");
-                var base64EncodingToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"x-access-token:{accessToken}"));
-                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", base64EncodingToken);
-            }
-        }
-
         private string GetWatermarkFilePath(string directory) => directory + ".completed";
+
+        private sealed class ActionTelemetryPayload
+        {
+            public string Operation { get; set; }
+            public string Result { get; set; }
+        }
 
         private ActionSetupInfo PrepareRepositoryActionAsync(IExecutionContext executionContext, Pipelines.ActionStep repositoryAction)
         {
@@ -877,7 +1440,7 @@ namespace GitHub.Runner.Worker
             if (File.Exists(actionManifest) || File.Exists(actionManifestYaml))
             {
                 executionContext.Debug($"action.yml for action: '{actionManifest}'.");
-                var manifestManager = HostContext.GetService<IActionManifestManager>();
+                var manifestManager = HostContext.GetService<IActionManifestManagerWrapper>();
                 ActionDefinitionData actionDefinitionData = null;
                 if (File.Exists(actionManifest))
                 {
@@ -891,7 +1454,7 @@ namespace GitHub.Runner.Worker
                 if (actionDefinitionData.Execution.ExecutionType == ActionExecutionType.Container)
                 {
                     var containerAction = actionDefinitionData.Execution as ContainerActionExecutionData;
-                    if (containerAction.Image.EndsWith("Dockerfile") || containerAction.Image.EndsWith("dockerfile"))
+                    if (DockerUtil.IsDockerfile(containerAction.Image))
                     {
                         var dockerFileFullPath = Path.Combine(actionEntryDirectory, containerAction.Image);
                         executionContext.Debug($"Dockerfile for action: '{dockerFileFullPath}'.");
@@ -928,17 +1491,19 @@ namespace GitHub.Runner.Worker
                 }
                 else if (actionDefinitionData.Execution.ExecutionType == ActionExecutionType.Composite)
                 {
-                    // TODO: we need to generate unique Id's for composite steps
                     Trace.Info($"Loading Composite steps");
                     var compositeAction = actionDefinitionData.Execution as CompositeActionExecutionData;
                     setupInfo.Steps = compositeAction.Steps;
 
-                    foreach (var step in compositeAction.Steps)
+                    // cache steps ids if not done so already
+                    if (!_cachedEmbeddedStepIds.ContainsKey(repositoryAction.Id))
                     {
-                        step.Id = Guid.NewGuid();
-                        if (string.IsNullOrEmpty(executionContext.Global.Variables.Get("DistributedTask.EnableCompositeActions")) && step.Reference.Type != Pipelines.ActionSourceType.Script)
+                        _cachedEmbeddedStepIds[repositoryAction.Id] = new List<Guid>();
+                        foreach (var compositeStep in compositeAction.Steps)
                         {
-                            throw new Exception("`uses:` keyword is not currently supported.");
+                            var guid = Guid.NewGuid();
+                            compositeStep.Id = guid;
+                            _cachedEmbeddedStepIds[repositoryAction.Id].Add(guid);
                         }
                     }
 
@@ -967,11 +1532,60 @@ namespace GitHub.Runner.Worker
             }
             else
             {
-                var fullPath = IOUtil.ResolvePath(actionEntryDirectory, "."); // resolve full path without access filesystem.
-                throw new InvalidOperationException($"Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under '{fullPath}'. Did you forget to run actions/checkout before running your local action?");
+                var reference = repositoryReference.Name;
+                if (!string.IsNullOrEmpty(repositoryReference.Path))
+                {
+                    reference = $"{reference}/{repositoryReference.Path}";
+                }
+                if (!string.IsNullOrEmpty(repositoryReference.Ref))
+                {
+                    reference = $"{reference}@{repositoryReference.Ref}";
+                }
+                throw new InvalidOperationException($"Can't find 'action.yml', 'action.yaml' or 'Dockerfile' for action '{reference}'.");
             }
         }
 
+        /// <summary>
+        /// Resolves self-reference ($/) references by mutating them in-place
+        /// to standard GitHub repository references with the containing repo's
+        /// name and ref.
+        /// </summary>
+        private void ResolveSelfRepositoryReferences(IExecutionContext executionContext, IEnumerable<Pipelines.ActionStep> actions, string repoName, string repoRef)
+        {
+            if (string.IsNullOrEmpty(repoName) || string.IsNullOrEmpty(repoRef))
+            {
+                return;
+            }
+
+            foreach (var action in actions)
+            {
+                if (action.Reference.Type != Pipelines.ActionSourceType.Repository)
+                {
+                    continue;
+                }
+
+                var repoAction = action.Reference as Pipelines.RepositoryPathReference;
+                if (!string.Equals(repoAction.RepositoryType, Pipelines.PipelineConstants.SelfRepositoryAlias, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Trace.Info($"Resolving self-repository reference reference '$/{repoAction.Path}' to '{repoName}/{repoAction.Path}@{repoRef}'");
+                executionContext.Debug($"Resolving $/{repoAction.Path} → {repoName}/{repoAction.Path}@{repoRef}");
+
+                repoAction.RepositoryType = Pipelines.RepositoryTypes.GitHub;
+                repoAction.Name = repoName;
+                repoAction.Ref = repoRef;
+            }
+        }
+
+        /// <summary>
+        /// If this is a reusable workflow job, ensure the workflow repo tarball
+        /// is downloaded so self.workspace resolves to a real path on disk.
+        /// Always downloads for reusable workflows when the feature flag is on,
+        /// since step expressions are already expanded by the server and can't
+        /// be scanned for self.* usage.
+        /// </summary>
         private static string GetDownloadInfoLookupKey(Pipelines.ActionStep action)
         {
             if (action.Reference.Type != Pipelines.ActionSourceType.Repository)
@@ -987,6 +1601,11 @@ namespace GitHub.Runner.Worker
                 return null;
             }
 
+            if (string.Equals(repositoryReference.RepositoryType, Pipelines.PipelineConstants.SelfRepositoryAlias, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"Unable to resolve self-reference '$/'. This can occur when the server does not support this syntax, the feature flag is disabled, or the workflow context (repository/SHA) is unavailable.");
+            }
+
             if (!string.Equals(repositoryReference.RepositoryType, Pipelines.RepositoryTypes.GitHub, StringComparison.OrdinalIgnoreCase))
             {
                 throw new NotSupportedException(repositoryReference.RepositoryType);
@@ -997,23 +1616,147 @@ namespace GitHub.Runner.Worker
             return $"{repositoryReference.Name}@{repositoryReference.Ref}";
         }
 
-        private static string GetDownloadInfoLookupKey(WebApi.ActionDownloadInfo info)
-        {
-            ArgUtil.NotNullOrEmpty(info.NameWithOwner, nameof(info.NameWithOwner));
-            ArgUtil.NotNullOrEmpty(info.Ref, nameof(info.Ref));
-            return $"{info.NameWithOwner}@{info.Ref}";
-        }
-
-        private AuthenticationHeaderValue CreateAuthHeader(string token)
+        private AuthenticationHeaderValue CreateAuthHeader(IExecutionContext executionContext, string downloadUrl, string token)
         {
             if (string.IsNullOrEmpty(token))
             {
                 return null;
             }
 
-            var base64EncodingToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"x-access-token:{token}"));
-            HostContext.SecretMasker.AddValue(base64EncodingToken);
-            return new AuthenticationHeaderValue("Basic", base64EncodingToken);
+            if (executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.UseBearerTokenForCodeload) == true &&
+                Uri.TryCreate(downloadUrl, UriKind.Absolute, out var parsedUrl) &&
+                !string.IsNullOrEmpty(parsedUrl?.Host) &&
+                !string.IsNullOrEmpty(parsedUrl?.PathAndQuery) &&
+                (parsedUrl.Host.StartsWith("codeload.", StringComparison.OrdinalIgnoreCase) || parsedUrl.PathAndQuery.StartsWith("/_codeload/", StringComparison.OrdinalIgnoreCase)))
+            {
+                Trace.Info("Using Bearer token for action archive download directly to codeload.");
+                return new AuthenticationHeaderValue("Bearer", token);
+            }
+            else
+            {
+                Trace.Info("Using Basic token for action archive download.");
+                var base64EncodingToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"x-access-token:{token}"));
+                HostContext.SecretMasker.AddValue(base64EncodingToken);
+                return new AuthenticationHeaderValue("Basic", base64EncodingToken);
+            }
+        }
+
+        private async Task DownloadRepositoryArchive(IExecutionContext executionContext, string downloadUrl, string downloadAuthToken, string archiveFile)
+        {
+            Trace.Info($"Save archive '{downloadUrl}' into {archiveFile}.");
+            int retryCount = 0;
+
+            // Allow up to 20 * 60s for any action to be downloaded from github graph.
+            int timeoutSeconds = 20 * 60;
+            try
+            {
+                while (retryCount < 3)
+                {
+                    string requestId = string.Empty;
+                    using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+                    using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                    {
+                        try
+                        {
+                            //open zip stream in async mode
+                            using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
+                            using (var httpClientHandler = HostContext.CreateHttpClientHandler())
+                            using (var httpClient = new HttpClient(httpClientHandler))
+                            {
+                                httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(executionContext, downloadUrl, downloadAuthToken);
+
+                                httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
+                                using (var response = await httpClient.GetAsync(downloadUrl))
+                                {
+                                    requestId = UrlUtil.GetGitHubRequestId(response.Headers);
+                                    if (!string.IsNullOrEmpty(requestId))
+                                    {
+                                        Trace.Info($"Request URL: {downloadUrl} X-GitHub-Request-Id: {requestId} Http Status: {response.StatusCode}");
+                                    }
+
+                                    if (response.IsSuccessStatusCode)
+                                    {
+                                        using (var result = await response.Content.ReadAsStreamAsync())
+                                        {
+                                            await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
+                                            await fs.FlushAsync(actionDownloadCancellation.Token);
+
+                                            // download succeed, break out the retry loop.
+                                            break;
+                                        }
+                                    }
+                                    else if (response.StatusCode == HttpStatusCode.NotFound)
+                                    {
+                                        // It doesn't make sense to retry in this case, so just stop
+                                        throw new ActionNotFoundException(new Uri(downloadUrl), requestId);
+                                    }
+                                    else if (response.StatusCode == HttpStatusCode.Forbidden)
+                                    {
+                                        // It doesn't make sense to retry in this case, so just stop
+                                        throw new AccessDeniedException($"Access denied to '{downloadUrl}' ({requestId})");
+                                    }
+                                    else
+                                    {
+                                        // Something else bad happened, let's go to our retry logic
+                                        response.EnsureSuccessStatusCode();
+                                    }
+                                }
+                            }
+                        }
+                        catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
+                        {
+                            Trace.Info("Action download has been cancelled.");
+                            throw;
+                        }
+                        catch (OperationCanceledException ex) when (!executionContext.CancellationToken.IsCancellationRequested && retryCount >= 2)
+                        {
+                            Trace.Info($"Action download final retry timeout after {timeoutSeconds} seconds.");
+                            throw new TimeoutException($"Action '{downloadUrl}' download has timed out. Error: {ex.Message} {requestId}");
+                        }
+                        catch (ActionNotFoundException)
+                        {
+                            Trace.Info($"The action at '{downloadUrl}' does not exist");
+                            throw;
+                        }
+                        catch (AccessDeniedException)
+                        {
+                            Trace.Info($"Access denied to '{downloadUrl}'");
+                            throw;
+                        }
+                        catch (Exception ex) when (retryCount < 2)
+                        {
+                            retryCount++;
+                            Trace.Error($"Fail to download archive '{downloadUrl}' -- Attempt: {retryCount}");
+                            Trace.Error(ex);
+                            if (actionDownloadTimeout.Token.IsCancellationRequested)
+                            {
+                                // action download didn't finish within timeout
+                                executionContext.Warning($"Action '{downloadUrl}' didn't finish download within {timeoutSeconds} seconds. {requestId}");
+                            }
+                            else
+                            {
+                                executionContext.Warning($"Failed to download action '{downloadUrl}'. Error: {ex.Message} {requestId}");
+                            }
+                        }
+                    }
+
+                    if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
+                    {
+                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
+                        executionContext.Warning($"Back off {backOff.TotalSeconds} seconds before retry.");
+                        await Task.Delay(backOff);
+                    }
+                }
+            }
+            catch (Exception ex) when (!(ex is AccessDeniedException) && !(ex is OperationCanceledException) && !executionContext.CancellationToken.IsCancellationRequested)
+            {
+                Trace.Error($"Failed to download archive '{downloadUrl}' after {retryCount + 1} attempts.");
+                Trace.Error(ex);
+                throw new FailedToDownloadActionException($"Failed to download archive '{downloadUrl}' after {retryCount + 1} attempts.", ex);
+            }
+
+            ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
+            executionContext.Debug($"Download '{downloadUrl}' to '{archiveFile}'");
         }
     }
 
@@ -1077,6 +1820,8 @@ namespace GitHub.Runner.Worker
         public string Pre { get; set; }
 
         public string Post { get; set; }
+
+        public string NodeVersion { get; set; }
     }
 
     public sealed class PluginActionExecutionData : ActionExecutionData
@@ -1102,9 +1847,11 @@ namespace GitHub.Runner.Worker
     public sealed class CompositeActionExecutionData : ActionExecutionData
     {
         public override ActionExecutionType ExecutionType => ActionExecutionType.Composite;
-        public override bool HasPre => false;
-        public override bool HasPost => false;
+        public override bool HasPre => PreSteps.Count > 0;
+        public override bool HasPost => PostSteps.Count > 0;
+        public List<Pipelines.ActionStep> PreSteps { get; set; }
         public List<Pipelines.ActionStep> Steps { get; set; }
+        public Stack<Pipelines.ActionStep> PostSteps { get; set; }
         public MappingToken Outputs { get; set; }
     }
 
@@ -1168,7 +1915,7 @@ namespace GitHub.Runner.Worker
     public class ActionSetupInfo
     {
         public ActionContainer Container { get; set; }
-        public List<Pipelines.ActionStep> Steps {get; set;}
+        public List<Pipelines.ActionStep> Steps { get; set; }
     }
 
     public class PrepareActionsState

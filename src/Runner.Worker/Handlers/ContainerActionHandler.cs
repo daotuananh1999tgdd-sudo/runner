@@ -1,14 +1,15 @@
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
-using System;
-using GitHub.Runner.Worker.Container;
-using Pipelines = GitHub.DistributedTask.Pipelines;
+using GitHub.DistributedTask.Pipelines.ContextData;
+using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
 using GitHub.Runner.Sdk;
-using GitHub.DistributedTask.WebApi;
-using GitHub.DistributedTask.Pipelines.ContextData;
-using System.Linq;
+using GitHub.Runner.Worker.Container;
+using GitHub.Runner.Worker.Container.ContainerHooks;
+using Pipelines = GitHub.DistributedTask.Pipelines;
 
 namespace GitHub.Runner.Worker.Handlers
 {
@@ -37,37 +38,59 @@ namespace GitHub.Runner.Worker.Handlers
             // Update the env dictionary.
             AddInputsToEnvironment();
 
-            var dockerManager = HostContext.GetService<IDockerCommandManager>();
+            IDockerCommandManager dockerManager = null;
+            IContainerHookManager containerHookManager = null;
+            if (FeatureManager.IsContainerHooksEnabled(ExecutionContext.Global.Variables))
+            {
+                containerHookManager = HostContext.GetService<IContainerHookManager>();
+            }
+            else
+            {
+                dockerManager = HostContext.GetService<IDockerCommandManager>();
+            }
+
+            string dockerFile = null;
 
             // container image haven't built/pull
             if (Data.Image.StartsWith("docker://", StringComparison.OrdinalIgnoreCase))
             {
                 Data.Image = Data.Image.Substring("docker://".Length);
             }
-            else if (Data.Image.EndsWith("Dockerfile") || Data.Image.EndsWith("dockerfile"))
+            else if (DockerUtil.IsDockerfile(Data.Image))
             {
                 // ensure docker file exist
-                var dockerFile = Path.Combine(ActionDirectory, Data.Image);
+                dockerFile = Path.Combine(ActionDirectory, Data.Image);
                 ArgUtil.File(dockerFile, nameof(Data.Image));
-
-                ExecutionContext.Output($"##[group]Building docker image");
-                ExecutionContext.Output($"Dockerfile for action: '{dockerFile}'.");
-                var imageName = $"{dockerManager.DockerInstanceLabel}:{ExecutionContext.Id.ToString("N")}";
-                var buildExitCode = await dockerManager.DockerBuild(
-                    ExecutionContext,
-                    ExecutionContext.GetGitHubContext("workspace"),
-                    dockerFile,
-                    Directory.GetParent(dockerFile).FullName,
-                    imageName);
-                ExecutionContext.Output("##[endgroup]");
-
-                if (buildExitCode != 0)
+                if (!FeatureManager.IsContainerHooksEnabled(ExecutionContext.Global.Variables))
                 {
-                    throw new InvalidOperationException($"Docker build failed with exit code {buildExitCode}");
-                }
+                    ExecutionContext.Output($"##[group]Building docker image");
+                    ExecutionContext.Output($"Dockerfile for action: '{dockerFile}'.");
+                    var imageName = $"{dockerManager.DockerInstanceLabel}:{ExecutionContext.Id.ToString("N")}";
+                    var buildExitCode = await dockerManager.DockerBuild(
+                        ExecutionContext,
+                        ExecutionContext.GetGitHubContext("workspace"),
+                        dockerFile,
+                        Directory.GetParent(dockerFile).FullName,
+                        imageName);
+                    ExecutionContext.Output("##[endgroup]");
 
-                Data.Image = imageName;
+                    if (buildExitCode != 0)
+                    {
+                        throw new InvalidOperationException($"Docker build failed with exit code {buildExitCode}");
+                    }
+
+                    Data.Image = imageName;
+                }
             }
+
+            string type = Action.Type == Pipelines.ActionSourceType.Repository ? "Dockerfile" : "DockerHub";
+            // Set extra telemetry base on the current context.
+            if (stage == ActionRunStage.Main)
+            {
+                ExecutionContext.StepTelemetry.HasPreStep = Data.HasPre;
+                ExecutionContext.StepTelemetry.HasPostStep = Data.HasPost;
+            }
+            ExecutionContext.StepTelemetry.Type = type;
 
             // run container
             var container = new ContainerInfo(HostContext)
@@ -112,7 +135,7 @@ namespace GitHub.Runner.Worker.Handlers
             var extraExpressionValues = new Dictionary<string, PipelineContextData>(StringComparer.OrdinalIgnoreCase);
             extraExpressionValues["inputs"] = inputsContext;
 
-            var manifestManager = HostContext.GetService<IActionManifestManager>();
+            var manifestManager = HostContext.GetService<IActionManifestManagerWrapper>();
             if (Data.Arguments != null)
             {
                 container.ContainerEntryPointArgs = "";
@@ -168,11 +191,13 @@ namespace GitHub.Runner.Worker.Handlers
             ArgUtil.Directory(tempWorkflowDirectory, nameof(tempWorkflowDirectory));
 
             container.MountVolumes.Add(new MountVolume("/var/run/docker.sock", "/var/run/docker.sock"));
+            container.MountVolumes.Add(new MountVolume(tempDirectory, "/github/runner_temp"));
             container.MountVolumes.Add(new MountVolume(tempHomeDirectory, "/github/home"));
             container.MountVolumes.Add(new MountVolume(tempWorkflowDirectory, "/github/workflow"));
             container.MountVolumes.Add(new MountVolume(tempFileCommandDirectory, "/github/file_commands"));
             container.MountVolumes.Add(new MountVolume(defaultWorkingDirectory, "/github/workspace"));
 
+            container.AddPathTranslateMapping(tempDirectory, "/github/runner_temp");
             container.AddPathTranslateMapping(tempHomeDirectory, "/github/home");
             container.AddPathTranslateMapping(tempWorkflowDirectory, "/github/workflow");
             container.AddPathTranslateMapping(tempFileCommandDirectory, "/github/file_commands");
@@ -200,20 +225,53 @@ namespace GitHub.Runner.Worker.Handlers
             {
                 Environment["ACTIONS_CACHE_URL"] = cacheUrl;
             }
+            if (systemConnection.Data.TryGetValue("PipelinesServiceUrl", out var pipelinesServiceUrl) && !string.IsNullOrEmpty(pipelinesServiceUrl))
+            {
+                Environment["ACTIONS_RUNTIME_URL"] = pipelinesServiceUrl;
+            }
+            if (systemConnection.Data.TryGetValue("GenerateIdTokenUrl", out var generateIdTokenUrl) && !string.IsNullOrEmpty(generateIdTokenUrl))
+            {
+                Environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = generateIdTokenUrl;
+                Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
+            }
+            if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+            {
+                Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
+            }
+
+            if (ExecutionContext.Global.Variables.TryGetValue("actions_cache_mode", out var cacheMode) && !string.IsNullOrEmpty(cacheMode))
+            {
+                Environment["ACTIONS_CACHE_MODE"] = cacheMode;
+            }
+
+            if (ExecutionContext.Global.Variables.GetBoolean(Constants.Runner.Features.SetOrchestrationIdEnvForActions) ?? false)
+            {
+                if (ExecutionContext.Global.Variables.TryGetValue(Constants.Variables.System.OrchestrationId, out var orchestrationId) && !string.IsNullOrEmpty(orchestrationId))
+                {
+                    Environment["ACTIONS_ORCHESTRATION_ID"] = orchestrationId;
+                }
+            }
 
             foreach (var variable in this.Environment)
             {
                 container.ContainerEnvironmentVariables[variable.Key] = container.TranslateToContainerPath(variable.Value);
             }
 
-            using (var stdoutManager = new OutputManager(ExecutionContext, ActionCommandManager, container))
-            using (var stderrManager = new OutputManager(ExecutionContext, ActionCommandManager, container))
+            if (FeatureManager.IsContainerHooksEnabled(ExecutionContext.Global.Variables))
             {
-                var runExitCode = await dockerManager.DockerRun(ExecutionContext, container, stdoutManager.OnDataReceived, stderrManager.OnDataReceived);
-                ExecutionContext.Debug($"Docker Action run completed with exit code {runExitCode}");
-                if (runExitCode != 0)
+                await containerHookManager.RunContainerStepAsync(ExecutionContext, container, dockerFile);
+            }
+            else
+            {
+                using (var stdoutManager = new OutputManager(ExecutionContext, ActionCommandManager, container))
+                using (var stderrManager = new OutputManager(ExecutionContext, ActionCommandManager, container))
                 {
-                    ExecutionContext.Result = TaskResult.Failed;
+                    var runExitCode = await dockerManager.DockerRun(ExecutionContext, container, stdoutManager.OnDataReceived, stderrManager.OnDataReceived);
+                    ExecutionContext.Debug($"Docker Action run completed with exit code {runExitCode}");
+                    if (runExitCode != 0)
+                    {
+                        ExecutionContext.Result = TaskResult.Failed;
+                    }
                 }
             }
 #endif

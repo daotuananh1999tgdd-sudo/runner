@@ -1,14 +1,14 @@
-﻿using GitHub.Services.Common.Diagnostics;
-using System;
+﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Linq;
+using GitHub.Services.Common.Diagnostics;
 using GitHub.Services.Common.Internal;
 
 namespace GitHub.Services.Common
@@ -36,7 +36,7 @@ namespace GitHub.Services.Common
         }
 
         public VssHttpRetryMessageHandler(
-            VssHttpRetryOptions options, 
+            VssHttpRetryOptions options,
             HttpMessageHandler innerHandler)
             : base(innerHandler)
         {
@@ -55,7 +55,7 @@ namespace GitHub.Services.Common
             // Allow overriding default retry options per request
             VssHttpRetryOptions retryOptions = m_retryOptions;
             object retryOptionsObject;
-            if (request.Properties.TryGetValue(HttpRetryOptionsKey, out retryOptionsObject)) // NETSTANDARD compliant, TryGetValue<T> is not
+            if (request.Options.TryGetValue(HttpRetryOptionsKey, out retryOptionsObject)) // NETSTANDARD compliant, TryGetValue<T> is not
             {
                 // Fallback to default options if object of unexpected type was passed
                 retryOptions = retryOptionsObject as VssHttpRetryOptions ?? m_retryOptions;
@@ -66,7 +66,7 @@ namespace GitHub.Services.Common
 
             IVssHttpRetryInfo retryInfo = null;
             object retryInfoObject;
-            if (request.Properties.TryGetValue(HttpRetryInfoKey, out retryInfoObject)) // NETSTANDARD compliant, TryGetValue<T> is not
+            if (request.Options.TryGetValue(HttpRetryInfoKey, out retryInfoObject)) // NETSTANDARD compliant, TryGetValue<T> is not
             {
                 retryInfo = retryInfoObject as IVssHttpRetryInfo;
             }
@@ -183,7 +183,7 @@ namespace GitHub.Services.Common
         {
             // implement in Server so retries are recorded in ProductTrace
         }
-        
+
         protected virtual void TraceHttpRequestFailed(VssTraceActivity activity, HttpRequestMessage request, HttpStatusCode statusCode, string afdRefInfo)
         {
             VssHttpEventSource.Log.HttpRequestFailed(activity, request, statusCode, afdRefInfo);
@@ -212,7 +212,7 @@ namespace GitHub.Services.Common
         private static bool IsLowPriority(HttpRequestMessage request)
         {
             bool isLowPriority = false;
-            
+
             IEnumerable<string> headers;
 
             if (request.Headers.TryGetValues(HttpHeaders.VssRequestPriority, out headers) && headers != null)

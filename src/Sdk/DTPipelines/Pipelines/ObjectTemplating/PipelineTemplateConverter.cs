@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
 using GitHub.DistributedTask.Expressions2;
 using GitHub.DistributedTask.Expressions2.Sdk;
@@ -54,7 +55,18 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         break;
                     case ActionSourceType.Repository:
                         var repositoryReference = step.Reference as RepositoryPathReference;
-                        name = !String.IsNullOrEmpty(repositoryReference.Name) ? repositoryReference.Name : PipelineConstants.SelfAlias;
+                        if (!String.IsNullOrEmpty(repositoryReference.Name))
+                        {
+                            name = repositoryReference.Name;
+                        }
+                        else if (String.Equals(repositoryReference.RepositoryType, PipelineConstants.SelfRepositoryAlias, StringComparison.OrdinalIgnoreCase))
+                        {
+                            name = PipelineConstants.SelfRepositoryAlias;
+                        }
+                        else
+                        {
+                            name = PipelineConstants.SelfAlias;
+                        }
                         break;
                 }
 
@@ -236,7 +248,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         internal static JobContainer ConvertToJobContainer(
             TemplateContext context,
             TemplateToken value,
-            bool allowExpressions = false)
+            bool allowExpressions = false,
+            bool allowServiceContainerCommand = false)
         {
             var result = new JobContainer();
             if (allowExpressions && value.Traverse().Any(x => x is ExpressionToken))
@@ -279,6 +292,22 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         case PipelineTemplateConstants.Options:
                             result.Options = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
                             break;
+                        case PipelineTemplateConstants.Entrypoint:
+                            if (!allowServiceContainerCommand)
+                            {
+                                context.Error(containerPropertyPair.Key, $"The key '{PipelineTemplateConstants.Entrypoint}' is not allowed");
+                                break;
+                            }
+                            result.Entrypoint = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
+                            break;
+                        case PipelineTemplateConstants.Command:
+                            if (!allowServiceContainerCommand)
+                            {
+                                context.Error(containerPropertyPair.Key, $"The key '{PipelineTemplateConstants.Command}' is not allowed");
+                                break;
+                            }
+                            result.Command = containerPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Container} {propertyName}").Value;
+                            break;
                         case PipelineTemplateConstants.Ports:
                             var ports = containerPropertyPair.Value.AssertSequence($"{PipelineTemplateConstants.Container} {propertyName}");
                             var portList = new List<String>(ports.Count);
@@ -316,7 +345,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
 
             if (String.IsNullOrEmpty(result.Image))
             {
-                context.Error(value, "Container image cannot be empty");
+                return null;
             }
 
             return result;
@@ -325,7 +354,8 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         internal static List<KeyValuePair<String, JobContainer>> ConvertToJobServiceContainers(
             TemplateContext context,
             TemplateToken services,
-            bool allowExpressions = false)
+            bool allowExpressions = false,
+            bool allowServiceContainerCommand = false)
         {
             var result = new List<KeyValuePair<String, JobContainer>>();
 
@@ -339,11 +369,75 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             foreach (var servicePair in servicesMapping)
             {
                 var networkAlias = servicePair.Key.AssertString("services key").Value;
-                var container = ConvertToJobContainer(context, servicePair.Value);
+                var container = ConvertToJobContainer(context, servicePair.Value, allowExpressions, allowServiceContainerCommand);
                 result.Add(new KeyValuePair<String, JobContainer>(networkAlias, container));
             }
 
             return result;
+        }
+
+        internal static Snapshot ConvertToJobSnapshotRequest(TemplateContext context, TemplateToken token)
+        {
+            string imageName = null;
+            string version = "1.*";
+            string versionString = string.Empty;
+            var condition = $"{PipelineTemplateConstants.Success}()";
+
+            if (token is StringToken snapshotStringLiteral)
+            {
+                imageName = snapshotStringLiteral.Value;
+            }
+            else
+            {
+                var snapshotMapping = token.AssertMapping($"{PipelineTemplateConstants.Snapshot}");
+                foreach (var snapshotPropertyPair in snapshotMapping)
+                {
+                    var propertyName = snapshotPropertyPair.Key.AssertString($"{PipelineTemplateConstants.Snapshot} key");
+                    var propertyValue = snapshotPropertyPair.Value;
+                    switch (propertyName.Value)
+                    {
+                        case PipelineTemplateConstants.ImageName:
+                            imageName = snapshotPropertyPair.Value.AssertString($"{PipelineTemplateConstants.Snapshot} {propertyName}").Value;
+                            break;
+                        case PipelineTemplateConstants.If:
+                            condition = ConvertToIfCondition(context, propertyValue, false);
+                            break;
+                        case PipelineTemplateConstants.CustomImageVersion:
+                            versionString = propertyValue.AssertString($"job {PipelineTemplateConstants.Snapshot} {PipelineTemplateConstants.CustomImageVersion}").Value;
+                            version = IsSnapshotImageVersionValid(versionString) ? versionString : null;
+                            break;
+                        default:
+                            propertyName.AssertUnexpectedValue($"{PipelineTemplateConstants.Snapshot} key");
+                            break;
+                    }
+                }
+            }
+
+            if (String.IsNullOrEmpty(imageName))
+            {
+                return null;
+            }
+
+            return new Snapshot(imageName)
+            {
+                Condition = condition,
+                Version = version
+            };
+        }
+
+        private static bool IsSnapshotImageVersionValid(string versionString)
+        {
+            var versionSegments = versionString.Split(".");
+
+            if (versionSegments.Length != 2 ||
+                !versionSegments[1].Equals("*") ||
+                !Int32.TryParse(versionSegments[0], NumberStyles.None, CultureInfo.InvariantCulture, result: out int parsedMajor) ||
+                parsedMajor < 0)
+            {
+                return false;
+            }
+
+            return true;
         }
 
         private static ActionStep ConvertToStep(
@@ -517,6 +611,14 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         Path = uses.Value
                     };
                 }
+                else if (PipelineConstants.TryParseSelfRepository(uses.Value, out var selfPath))
+                {
+                    result.Reference = new RepositoryPathReference
+                    {
+                        RepositoryType = PipelineConstants.SelfRepositoryAlias,
+                        Path = selfPath
+                    };
+                }
                 else
                 {
                     var usesSegments = uses.Value.Split('@');
@@ -631,6 +733,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         {
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.GitHub),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Needs),
+            new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Vars),
         };
         private static readonly INamedValueInfo[] s_stepNamedValues = new INamedValueInfo[]
         {
@@ -638,10 +741,12 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Matrix),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Steps),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.GitHub),
+            new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Inputs),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Job),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Runner),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Env),
             new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Needs),
+            new NamedValueInfo<NoOperationNamedValue>(PipelineTemplateConstants.Vars),
         };
         private static readonly IFunctionInfo[] s_stepConditionFunctions = new IFunctionInfo[]
         {
